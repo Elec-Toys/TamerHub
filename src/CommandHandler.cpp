@@ -11,6 +11,7 @@ const char* const TAG = "CommandHandler";
 #include "estop/EStopManager.h"
 #include "estop/EStopState.h"
 #include "events/Events.h"
+#include "input/RotaryEncoderManager.h"
 #include "Logging.h"
 #include "radio/RFTransmitter.h"
 #include "SimpleMutex.h"
@@ -18,6 +19,7 @@ const char* const TAG = "CommandHandler";
 
 #include <freertos/queue.h>
 
+#include <algorithm>
 #include <memory>
 #include <unordered_map>
 
@@ -273,10 +275,14 @@ SetGPIOResultCode CommandHandler::SetRfTxPin(gpio_num_t txPin)
   return SetGPIOResultCode::Success;
 }
 
-bool CommandHandler::SetKeepAliveEnabled(bool enabled)
+bool CommandHandler::SetKeepAliveEnabled(bool enabled, bool persistConfig)
 {
   if (!internalSetKeepAliveEnabled(enabled)) {
     return false;
+  }
+
+  if (!persistConfig) {
+    return true;
   }
 
   if (!Config::SetRFConfigKeepAliveEnabled(enabled)) {
@@ -316,6 +322,10 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
     return false;
   }
 
+  if (type == ShockerCommandType::Shock || type == ShockerCommandType::Vibrate || type == ShockerCommandType::Sound) {
+    intensity = std::min(intensity, OpenShock::RotaryEncoderManager::GetMaxIntensityLimit());
+  }
+
   bool ok = transmitter->SendCommand(model, shockerId, type, intensity, durationMs);
 
   ScopedLock lock__ka(&s_keepAliveMutex);
@@ -328,4 +338,9 @@ bool CommandHandler::HandleCommand(ShockerModelType model, uint16_t shockerId, S
   }
 
   return ok;
+}
+
+uint8_t CommandHandler::GetCommandIntensityMaxLimit()
+{
+  return OpenShock::RotaryEncoderManager::GetMaxIntensityLimit();
 }

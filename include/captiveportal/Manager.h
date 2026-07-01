@@ -8,7 +8,13 @@
 namespace OpenShock::CaptivePortal {
   [[nodiscard]] bool Init();
 
-  void SetAlwaysEnabled(bool alwaysEnabled);
+  void SetEnabled(bool enabled);
+  bool IsEnabled();
+
+  void SetApEnabled(bool enabled, bool persistConfig = true);
+  bool IsApEnabled();
+
+  void SetAlwaysEnabled(bool alwaysEnabled, bool persistConfig = true);
   bool IsAlwaysEnabled();
 
   /// @brief Signal that the user has completed setup. The portal will close once the device is fully online.

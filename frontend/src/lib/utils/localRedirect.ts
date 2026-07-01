@@ -1,6 +1,6 @@
 const _localHostnames = ['localhost', '127.0.0.1'];
 
-const _localDeviceHost = import.meta.env.VITE_LOCAL_DEVICE_HOST ?? '4.3.2.1';
+const _localDeviceHost = import.meta.env.VITE_LOCAL_DEVICE_HOST ?? '8.8.8.8';
 
 /**
  * When the frontend is served locally (e.g. via `pnpm dev`), the device is

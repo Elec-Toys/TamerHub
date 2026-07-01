@@ -3,15 +3,17 @@
 const char* const TAG = "ShockerCommandHandler";
 
 #include "CommandHandler.h"
+#include "GatewayConnectionManager.h"
 #include "Logging.h"
 #include "ShockerModelType.h"
+#include "visual/OledDisplayManager.h"
 
 #include <cstdint>
 
 using FbsModelType   = OpenShock::Serialization::Types::ShockerModelType;
 using FbsCommandType = OpenShock::Serialization::Types::ShockerCommandType;
 
-void OpenShock::MessageHandlers::HandleShockerCommandList(const OpenShock::Serialization::Common::ShockerCommandList* cmdList)
+void OpenShock::MessageHandlers::HandleShockerCommandList(const OpenShock::Serialization::Common::ShockerCommandList* cmdList, bool fromGateway)
 {
   auto commands = cmdList->commands();
   if (commands == nullptr) {
@@ -64,6 +66,15 @@ void OpenShock::MessageHandlers::HandleShockerCommandList(const OpenShock::Seria
       default:
         OS_LOGE(TAG, "Unsupported command type: %s", OpenShock::Serialization::Types::EnumNameShockerCommandType(fbsCommandType));
         continue;
+    }
+
+    if (fromGateway) {
+      id = GatewayConnectionManager::ResolveOnlineRfId(id);
+    }
+
+    // Keep OLED state synchronized with web-triggered commands.
+    if (fromGateway) {
+      OpenShock::OledDisplayManager::NotifyGatewayShockerCommand(id, intensity, commandType, durationMs);
     }
 
     if (!CommandHandler::HandleCommand(model, id, commandType, intensity, durationMs)) {

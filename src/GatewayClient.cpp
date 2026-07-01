@@ -15,6 +15,8 @@ const char* const TAG = "GatewayClient";
 using namespace OpenShock;
 
 const int64_t GATEWAY_PING_TIMEOUT = 90'000;
+const int64_t GATEWAY_CONNECT_TIMEOUT = 20'000;
+const int64_t GATEWAY_DISCONNECT_TIMEOUT = 8'000;
 
 static bool s_bootStatusSent = false;
 
@@ -22,6 +24,7 @@ GatewayClient::GatewayClient(const std::string& authToken)
   : m_webSocket()
   , m_state(GatewayClientState::Disconnected)
   , m_lastPingTimestamp(0)
+  , m_stateSinceTimestamp(OpenShock::millis())
 {
   OS_LOGD(TAG, "Creating GatewayClient");
 
@@ -68,10 +71,14 @@ void GatewayClient::connect(const std::string& host, uint16_t port, const std::s
 
 void GatewayClient::disconnect()
 {
-  if (m_state != GatewayClientState::Connected) {
+  if (m_state == GatewayClientState::Disconnected) {
     return;
   }
-  _setState(GatewayClientState::Disconnecting);
+
+  if (m_state != GatewayClientState::Disconnecting) {
+    _setState(GatewayClientState::Disconnecting);
+  }
+
   m_webSocket.disconnect();
 }
 
@@ -108,6 +115,15 @@ bool GatewayClient::loop()
 
   // We are still in the process of connecting or disconnecting
   if (m_state != GatewayClientState::Connected) {
+    const int64_t now = OpenShock::millis();
+    const int64_t timeoutMs = (m_state == GatewayClientState::Connecting) ? GATEWAY_CONNECT_TIMEOUT : GATEWAY_DISCONNECT_TIMEOUT;
+    if (m_stateSinceTimestamp != 0 && (now - m_stateSinceTimestamp) > timeoutMs) {
+      OS_LOGW(TAG, "Gateway websocket state %u timed out after %lld ms, forcing reset", static_cast<unsigned>(m_state), timeoutMs);
+      m_webSocket.disconnect();
+      _setState(GatewayClientState::Disconnected);
+      return false;
+    }
+
     // return true to indicate that we are still busy
     return true;
   }
@@ -129,6 +145,7 @@ void GatewayClient::_setState(GatewayClientState state)
   }
 
   m_state = state;
+  m_stateSinceTimestamp = OpenShock::millis();
 
   ESP_ERROR_CHECK(esp_event_post(OPENSHOCK_EVENTS, OPENSHOCK_EVENT_GATEWAY_CLIENT_STATE_CHANGED, &m_state, sizeof(m_state), portMAX_DELAY));
 }

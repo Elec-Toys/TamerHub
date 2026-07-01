@@ -13,8 +13,8 @@
   }
 
   const advancedSections: AdvancedSectionDef[] = [
-    { id: 'wifi', label: 'WiFi', description: 'Network configuration', icon: Wifi },
-    { id: 'shocker', label: 'Shocker', description: 'Test your shockers', icon: Zap },
+    { id: 'shocker', label: 'Shockers', description: 'Test your shockers', icon: Zap },
+    { id: 'wifi', label: 'Network', description: 'Network configuration', icon: Wifi },
     { id: 'hardware', label: 'Hardware', description: 'GPIO pin configuration', icon: Cpu },
     { id: 'account', label: 'Account', description: 'Link to OpenShock', icon: User },
     { id: 'ota', label: 'Updates', description: 'OTA update settings', icon: Download },
@@ -104,13 +104,15 @@
         {#if activeSection === 'wifi'}
           <div class="flex flex-col gap-4">
             <div>
-              <h3 class="text-lg font-semibold">WiFi</h3>
+              <h3 class="text-lg font-semibold">Network</h3>
               <p class="text-muted-foreground text-sm">Manage wireless networks.</p>
             </div>
             <WiFiManager />
           </div>
         {:else if activeSection === 'shocker'}
-          <TestStep />
+          <div class="flex flex-col gap-4">
+            <TestStep />
+          </div>
         {:else if activeSection === 'hardware'}
           <div class="flex flex-col gap-4">
             <div>

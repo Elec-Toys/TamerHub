@@ -41,6 +41,7 @@ namespace OpenShock::CaptivePortal {
     WebSocketDeFragger m_socketDeFragger;
     fs::LittleFSFS m_fileSystem;
     DNSServer m_dnsServer;
+    bool m_dnsStarted;
     TaskHandle_t m_taskHandle;
     std::atomic<bool> m_stopRequested {false};
   };

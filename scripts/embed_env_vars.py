@@ -43,8 +43,26 @@ dot = dotenv.DotEnv(project_dir, dotenv_type)
 def get_git_repo():
     try:
         return git.Repo(search_parent_directories=True)
-    except git.exc.InvalidGitRepositoryError:
+    except (git.exc.InvalidGitRepositoryError, git.exc.GitError, ValueError):
         return None
+
+
+def get_git_commit(repo):
+    if repo is None:
+        return None
+    try:
+        return repo.head.object.hexsha
+    except (git.exc.GitError, ValueError, OSError):
+        return None
+
+
+def get_git_tags(repo):
+    if repo is None:
+        return []
+    try:
+        return [tag.name for tag in repo.tags]
+    except (git.exc.GitError, ValueError, OSError):
+        return []
 
 def sort_semver(versions):
     if not versions or len(versions) == 0:
@@ -77,8 +95,8 @@ def last_element(arr):
     return arr[-1] if len(arr) > 0 else None
 
 git_repo = get_git_repo()
-git_commit = git_repo.head.object.hexsha if git_repo is not None else None
-git_tags = [tag.name for tag in git_repo.tags] if git_repo is not None else []
+git_commit = get_git_commit(git_repo)
+git_tags = get_git_tags(git_repo)
 git_latest_clean_tag = last_element(sort_semver(git_tags))
 
 # Find env variables based on only the pioenv and sysenv.
@@ -266,5 +284,3 @@ env.Append(CXXFLAGS=['-fno-rtti', '-fno-threadsafe-statics', '-fno-use-cxa-atexi
 
 # Rename the firmware.bin to app.bin.
 env.Replace(PROGNAME='app')
-
-print(env.Dump())

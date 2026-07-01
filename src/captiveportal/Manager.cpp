@@ -10,10 +10,12 @@ const char* const TAG = "CaptivePortal";
 #include "Core.h"
 #include "GatewayConnectionManager.h"
 #include "Logging.h"
+#include "wifi/WiFiManager.h"
 
 #include <ESPAsyncWebServer.h>
 #include <WebSocketsServer.h>
 #include <WiFi.h>
+#include <Preferences.h>
 
 #include <esp_timer.h>
 
@@ -25,6 +27,8 @@ const char* const TAG = "CaptivePortal";
 using namespace OpenShock;
 
 static std::atomic<bool> s_alwaysEnabled                 = false;
+static std::atomic<bool> s_apEnabled                     = true;
+static std::atomic<bool> s_enabled                       = true;
 static std::atomic<bool> s_forceClosed                   = false;
 static std::atomic<bool> s_userDone                      = false;
 static esp_timer_handle_t s_captivePortalUpdateLoopTimer = nullptr;
@@ -63,6 +67,17 @@ static void DestroyInstance()
   s_instance = nullptr;
 }
 
+static void persistApEnabled(bool enabled)
+{
+  Preferences prefs;
+  if (!prefs.begin("oled_ui", false)) {
+    return;
+  }
+
+  prefs.putBool("ap_en", enabled);
+  prefs.end();
+}
+
 static bool captiveportal_start()
 {
   if (GetInstance() != nullptr) {
@@ -72,22 +87,27 @@ static bool captiveportal_start()
 
   OS_LOGI(TAG, "Starting captive portal");
 
-  if (!WiFi.enableAP(true)) {
-    OS_LOGE(TAG, "Failed to enable AP mode");
-    return false;
-  }
+  if (s_apEnabled.load(std::memory_order_relaxed)) {
+    if (!WiFi.enableAP(true)) {
+      OS_LOGE(TAG, "Failed to enable AP mode");
+      return false;
+    }
 
-  if (!WiFi.softAP((OPENSHOCK_FW_AP_PREFIX + WiFi.macAddress()).c_str())) {
-    OS_LOGE(TAG, "Failed to start AP");
-    WiFi.enableAP(false);
-    return false;
-  }
+    if (!WiFi.softAP((OPENSHOCK_FW_AP_PREFIX + WiFi.macAddress()).c_str())) {
+      OS_LOGE(TAG, "Failed to start AP");
+      WiFi.softAPdisconnect(true);
+      return false;
+    }
 
-  IPAddress apIP(4, 3, 2, 1);
-  if (!WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0))) {
-    OS_LOGE(TAG, "Failed to configure AP");
+    IPAddress apIP(4, 3, 2, 1);
+    if (!WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0))) {
+      OS_LOGE(TAG, "Failed to configure AP");
+      WiFi.softAPdisconnect(true);
+      return false;
+    }
+  } else {
     WiFi.softAPdisconnect(true);
-    return false;
+    WiFi.enableAP(false);
   }
 
   std::string hostname;
@@ -119,6 +139,38 @@ static void captiveportal_updateloop(void*)
 {
   int64_t now = esp_timer_get_time();
 
+  if (!s_enabled.load(std::memory_order_relaxed)) {
+    if (GetInstance() != nullptr) {
+      captiveportal_stop();
+    }
+    return;
+  }
+
+  // Force-close overrides everything — including alwaysEnabled — so OTA updates
+  // can always shut down the portal and free its memory/AP resources.
+  // Keep it closed while WiFi is connected, but clear the latch when WiFi drops
+  // so AP can recover automatically for offline reconfiguration.
+  if (s_forceClosed) {
+    if (!WiFiManager::IsConnected()) {
+      s_forceClosed = false;
+      OS_LOGI(TAG, "Clearing captive portal force-close latch (WiFi disconnected)");
+    } else {
+      if (GetInstance() != nullptr) {
+        OS_LOGD(TAG, "Force-closing captive portal");
+        captiveportal_stop();
+      }
+      return;
+    }
+  }
+
+  // If always enabled, ensure portal is running and skip all grace/auto-close logic
+  if (s_alwaysEnabled.load(std::memory_order_relaxed)) {
+    if (GetInstance() == nullptr) {
+      captiveportal_start();
+    }
+    return;
+  }
+
   // Startup grace period: device is fully configured, wait for gateway connection
   int64_t graceExpiry = s_startupGraceExpiry.load(std::memory_order_relaxed);
   if (graceExpiry != 0) {
@@ -133,15 +185,6 @@ static void captiveportal_updateloop(void*)
     }
     // Grace expired without gateway connection — open portal normally
     s_startupGraceExpiry.store(0, std::memory_order_relaxed);
-  }
-
-  // Force-closed by user (via /api/portal/close)
-  if (s_forceClosed) {
-    if (GetInstance() != nullptr) {
-      OS_LOGD(TAG, "Force-closing captive portal");
-      captiveportal_stop();
-    }
-    return;
   }
 
   // User completed setup — close portal once device is fully online
@@ -173,10 +216,11 @@ static void captiveportal_updateloop(void*)
     s_autoCloseExpiry.store(0, std::memory_order_relaxed);
   }
 
-  // Open portal if not running and device needs setup
+  // Open portal if not running and device needs setup, or when WiFi is down.
   if (instance == nullptr) {
     bool commandHandlerOk = CommandHandler::Ok();
-    bool shouldStart      = s_alwaysEnabled || !commandHandlerOk || !isDeviceFullyConfigured();
+    bool wifiConnected    = WiFiManager::IsConnected();
+    bool shouldStart      = s_alwaysEnabled || !wifiConnected || !commandHandlerOk || !isDeviceFullyConfigured();
     if (shouldStart) {
       OS_LOGD(TAG, "Starting captive portal");
       captiveportal_start();
@@ -186,6 +230,19 @@ static void captiveportal_updateloop(void*)
 
 bool CaptivePortal::Init()
 {
+  Preferences prefs;
+  if (prefs.begin("oled_ui", false)) {
+    const bool apEnabled = prefs.getBool("ap_en", true);
+    s_apEnabled.store(apEnabled, std::memory_order_relaxed);
+    prefs.end();
+  }
+
+  Config::CaptivePortalConfig portalConfig;
+  if (Config::GetCaptivePortalConfig(portalConfig)) {
+    s_enabled.store(portalConfig.alwaysEnabled, std::memory_order_relaxed);
+    s_alwaysEnabled.store(portalConfig.alwaysEnabled, std::memory_order_relaxed);
+  }
+
   // If device is already fully configured, set a startup grace period before opening portal
   if (isDeviceFullyConfigured()) {
     s_startupGraceExpiry.store(esp_timer_get_time() + STARTUP_GRACE_PERIOD_US, std::memory_order_relaxed);
@@ -217,14 +274,60 @@ bool CaptivePortal::Init()
   return true;
 }
 
+void CaptivePortal::SetEnabled(bool enabled)
+{
+  if (enabled) {
+    // Clear force-close latch so the portal can start again
+    s_forceClosed.store(false, std::memory_order_relaxed);
+  }
+  s_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool CaptivePortal::IsEnabled()
+{
+  return s_enabled.load(std::memory_order_relaxed);
+}
+
+void CaptivePortal::SetApEnabled(bool enabled, bool persistConfig)
+{
+  bool previous = s_apEnabled.exchange(enabled, std::memory_order_relaxed);
+  if (persistConfig) {
+    persistApEnabled(enabled);
+  }
+
+  if (previous == enabled) {
+    return;
+  }
+
+  if (GetInstance() != nullptr) {
+    captiveportal_stop();
+
+    if (s_enabled.load(std::memory_order_relaxed)) {
+      captiveportal_start();
+    }
+  } else if (!enabled) {
+    WiFi.softAPdisconnect(true);
+    WiFi.enableAP(false);
+  }
+}
+
+bool CaptivePortal::IsApEnabled()
+{
+  return s_apEnabled.load(std::memory_order_relaxed);
+}
+
 void CaptivePortal::SetUserDone()
 {
   s_userDone = true;
 }
 
-void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled)
+void CaptivePortal::SetAlwaysEnabled(bool alwaysEnabled, bool persistConfig)
 {
   s_alwaysEnabled = alwaysEnabled;
+  if (!persistConfig) {
+    return;
+  }
+
   Config::SetCaptivePortalConfig({
     .alwaysEnabled = alwaysEnabled,
   });

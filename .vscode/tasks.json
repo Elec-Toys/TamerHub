@@ -1,0 +1,194 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Upload LittleFS",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini",
+				"-t",
+				"uploadfs",
+				"-s"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP32-C3-SuperMini",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP32-C3-SuperMini quick check",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP32-C3-SuperMini verify",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP32-C3-SuperMini pages update",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build ESP32-C3-SuperMini crosshair",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"ESP32-C3-SuperMini"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Upload Generic-ESP32-Dev",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"Generic-ESP32-Dev",
+				"-t",
+				"upload"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Upload LittleFS Generic-ESP32-Dev",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"Generic-ESP32-Dev",
+				"-t",
+				"buildfs",
+				"-t",
+				"uploadfs"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Upload Generic-ESP32-Dev single job",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"Generic-ESP32-Dev",
+				"-j",
+				"1",
+				"-t",
+				"upload"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Generic-ESP32-Dev clean once",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"if (Test-Path '.pio/build/ESP32-C3-SuperMini') { Remove-Item '.pio/build/ESP32-C3-SuperMini' -Recurse -Force -ErrorAction SilentlyContinue }; & 'C:/Users/leven/.platformio/penv/Scripts/platformio.exe' run -e Generic-ESP32-Dev"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Generic-ESP32-Dev clean retry",
+			"type": "shell",
+			"command": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"if (Test-Path \".pio/build/ESP32-C3-SuperMini\") { Remove-Item \".pio/build/ESP32-C3-SuperMini\" -Recurse -Force -ErrorAction SilentlyContinue }; & \"C:/Users/leven/.platformio/penv/Scripts/platformio.exe\" run -e Generic-ESP32-Dev"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Kill stale platformio processes",
+			"type": "shell",
+			"command": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'platformio|python' -and $_.CommandLine -match 'platformio' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output \"Stopped PID $($_.ProcessId)\" }"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Force-stop PlatformIO tools",
+			"type": "shell",
+			"command": "taskkill",
+			"args": [
+				"/F",
+				"/IM",
+				"platformio.exe"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Upload Generic-ESP32-Dev-white-screen",
+			"type": "shell",
+			"command": "C:\\Users\\leven\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"Generic-ESP32-Dev-white-screen",
+				"-j",
+				"1",
+				"-t",
+				"upload"
+			],
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}

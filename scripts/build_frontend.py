@@ -2,6 +2,7 @@ import os
 import gzip
 import shutil
 import hashlib
+import subprocess
 from utils import sysenv
 
 Import('env')  # type: ignore
@@ -66,21 +67,72 @@ def file_write_text(file, text, enc):
         return False
 
 
-def build_frontend(source, target, env):
-    # Change working directory to frontend.
-    os.chdir('frontend')
+def ensure_data_placeholder():
+    dir_ensure('data')
+    placeholder = os.path.join('data', '.keep')
+    if not os.path.exists(placeholder):
+        file_write_text(placeholder, 'placeholder\n', 'utf-8')
 
-    # Build the frontend only if it wasn't already built.
-    # This is to avoid rebuilding the frontend every time the firmware is built.
-    # This could also lead to some annoying behaviour where the frontend is not updated when the firmware is built.
+
+def resolve_cmd(*names):
+    for name in names:
+        exe = shutil.which(name)
+        if exe and os.path.exists(exe):
+            return exe
+    return None
+
+
+def build_frontend(source, target, env):
+    project_root = os.getcwd()
+    frontend_dir = os.path.join(project_root, 'frontend')
+
+    # Always ensure data dir exists so littlefs has a valid source directory.
+    ensure_data_placeholder()
+
+    # Build frontend unless in CI where artifacts may already be prepared.
     if not sysenv.get_bool('CI', False):
         print('Building frontend...')
-        os.system('pnpm i')
-        os.system('pnpm run build')
-        print('Frontend build complete.')
 
-    # Change working directory back to root.
-    os.chdir('..')
+        package_manager = None
+        package_manager_exe = None
+        install_cmd = None
+        build_cmd = None
+
+        pnpm_exe = resolve_cmd('pnpm.cmd', 'pnpm')
+        corepack_exe = resolve_cmd('corepack.cmd', 'corepack')
+        npm_exe = resolve_cmd('npm.cmd', 'npm')
+
+        if pnpm_exe:
+            package_manager = 'pnpm'
+            package_manager_exe = pnpm_exe
+            install_cmd = [pnpm_exe, 'i']
+            build_cmd = [pnpm_exe, 'run', 'build']
+        elif corepack_exe:
+            package_manager = 'corepack pnpm'
+            package_manager_exe = corepack_exe
+            install_cmd = [corepack_exe, 'pnpm', 'i']
+            build_cmd = [corepack_exe, 'pnpm', 'run', 'build']
+        elif npm_exe:
+            package_manager = 'npm'
+            package_manager_exe = npm_exe
+            # Local dev machines can have newer Node than pinned engines; allow install fallback.
+            install_cmd = [npm_exe, 'install', '--force', '--no-audit', '--no-fund']
+            build_cmd = [npm_exe, 'run', 'build']
+
+        if package_manager is None:
+            print('No package manager found (pnpm/corepack/npm). Skipping frontend build.')
+        else:
+            print(f'Using {package_manager} ({package_manager_exe}) to build frontend')
+            try:
+                install_rc = subprocess.call(install_cmd, cwd=frontend_dir)
+                build_rc = subprocess.call(build_cmd, cwd=frontend_dir) if install_rc == 0 else -1
+                if install_rc != 0 or build_rc != 0:
+                    print('Frontend build failed; using existing frontend/build output if available.')
+                else:
+                    print('Frontend build complete.')
+            except OSError as e:
+                print(f'Failed to execute frontend build command: {e}')
+                print('Using existing frontend/build output if available.')
 
     # Shorten all the filenames in the data/www/_app/immutable directory.
     copy_actions = []
@@ -94,6 +146,13 @@ def build_frontend(source, target, env):
             newfilepath = os.path.join(newroot, filename)
 
             copy_actions.append((filepath, newfilepath))
+
+    if len(copy_actions) == 0:
+        if os.path.exists('data/www'):
+            print('No frontend build artifacts found; keeping existing data/www content.')
+            ensure_data_placeholder()
+            return
+        raise RuntimeError('No frontend build artifacts found and data/www is missing. Cannot produce LittleFS image with UI assets.')
 
     # Delete the data/www directory if it exists.
     dir_delete('data/www')

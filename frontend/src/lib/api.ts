@@ -29,6 +29,116 @@ export async function fetchBoardInfo(): Promise<void> {
 
 // WiFi
 
+export async function getWifiEnabled(): Promise<boolean | null> {
+  try {
+    const res = await apiFetch('/api/wifi/enabled');
+    if (res.ok) {
+      const data = await res.json();
+      return data.enabled ?? null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setWifiEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/api/wifi/enabled?enabled=${enabled ? '1' : '0'}`, {
+      method: 'PUT',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      hubState.wifiStaEnabled = data.enabled ?? enabled;
+      return true;
+    } else {
+      toast.error('Failed to change WiFi state');
+      return false;
+    }
+  } catch {
+    toast.error('Failed to change WiFi state');
+    return false;
+  }
+}
+
+export async function setCaptivePortalEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/api/portal/enabled?enabled=${enabled ? '1' : '0'}`, {
+      method: 'PUT',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const newEnabled = data.enabled ?? enabled;
+      hubState.captivePortalEnabled = newEnabled;
+      if (hubState.config) {
+        hubState.config.captivePortal.alwaysEnabled = newEnabled;
+      }
+      if (!newEnabled) {
+        hubState.wifiApEnabled = false;
+      }
+      return true;
+    } else {
+      toast.error('Failed to change captive portal state');
+      return false;
+    }
+  } catch {
+    toast.error('Failed to change captive portal state');
+    return false;
+  }
+}
+
+export async function getCaptivePortalEnabled(): Promise<boolean | null> {
+  try {
+    const res = await apiFetch('/api/portal/enabled');
+    if (res.ok) {
+      const data = await res.json();
+      return data.enabled ?? null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getApEnabled(): Promise<boolean | null> {
+  try {
+    const res = await apiFetch('/api/ap/enabled');
+    if (res.ok) {
+      const data = await res.json();
+      return data.enabled ?? null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setApEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/api/ap/enabled?enabled=${enabled ? '1' : '0'}`, {
+      method: 'PUT',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const newEnabled = data.enabled ?? enabled;
+      hubState.wifiApEnabled = newEnabled;
+      if (newEnabled) {
+        hubState.captivePortalEnabled = true;
+        if (hubState.config) {
+          hubState.config.captivePortal.alwaysEnabled = true;
+        }
+      }
+      return true;
+    }
+
+    toast.error('Failed to change access point state');
+    return false;
+  } catch {
+    toast.error('Failed to change access point state');
+    return false;
+  }
+}
+
 export async function startWifiScan(): Promise<void> {
   try {
     const res = await apiFetch('/api/wifi/scan?run=1', { method: 'POST' });
@@ -136,6 +246,26 @@ export async function setRfTxPin(pin: number): Promise<boolean> {
     }
   } catch {
     toast.error('Failed to change RF TX pin');
+    return false;
+  }
+}
+
+export async function setRfKeepaliveEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await apiFetch(
+      '/api/config/rf/keepalive?' + new URLSearchParams({ enabled: enabled ? '1' : '0' }),
+      { method: 'PUT' },
+    );
+    if (res.ok) {
+      if (hubState.config) hubState.config.rf.keepaliveEnabled = enabled;
+      toast.success('Changed RF keepalive to: ' + enabled);
+      return true;
+    } else {
+      toast.error('Failed to change RF keepalive');
+      return false;
+    }
+  } catch {
+    toast.error('Failed to change RF keepalive');
     return false;
   }
 }
@@ -286,10 +416,36 @@ export async function setOtaRequireManualApproval(require: boolean): Promise<voi
   }
 }
 
-export async function checkOtaUpdates(channel: string): Promise<void> {
+export async function checkOtaUpdates(_channel?: string): Promise<void> {
   try {
-    await apiFetch(`/api/ota/check?` + new URLSearchParams({ channel }), { method: 'POST' });
+    await apiFetch(`/api/ota/check`, { method: 'POST' });
   } catch {
     toast.error('Failed to check for OTA updates');
+  }
+}
+
+export interface OtaSettings {
+  repoSlug: string;
+  allowBackendManagement: boolean;
+  promptUpdates: boolean;
+}
+
+export async function getOtaSettings(): Promise<OtaSettings | null> {
+  try {
+    const res = await apiFetch('/api/ota/settings', { method: 'GET' });
+    if (!res.ok) return null;
+    return (await res.json()) as OtaSettings;
+  } catch {
+    return null;
+  }
+}
+
+export async function installOtaUpdate(version: string): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/api/ota/install?` + new URLSearchParams({ version }), { method: 'POST' });
+    return res.ok;
+  } catch {
+    toast.error('Failed to start firmware update');
+    return false;
   }
 }

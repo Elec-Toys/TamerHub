@@ -1,4 +1,4 @@
-import { stopWifiScan } from '$lib/api';
+import { stopWifiScan, getWifiEnabled, getApEnabled, getCaptivePortalEnabled } from '$lib/api';
 import type { WebSocketClient } from '$lib/WebSocketClient';
 import { ErrorMessage } from '$lib/_fbs/open-shock/serialization/local/error-message';
 import { HubToLocalMessage } from '$lib/_fbs/open-shock/serialization/local/hub-to-local-message';
@@ -9,9 +9,31 @@ import { AccountLinkStatusEvent } from '$lib/_fbs/open-shock/serialization/local
 import { WifiGotIpEvent } from '$lib/_fbs/open-shock/serialization/local/wifi-got-ip-event';
 import { mapConfig } from '$lib/mappers/ConfigMapper';
 import { hubState } from '$lib/stores';
+import { getApiBaseUrl } from '$lib/utils/localRedirect';
 import { ByteBuffer } from 'flatbuffers';
 import { toast } from 'svelte-sonner';
 import { WifiNetworkEventHandler } from './WifiNetworkEventHandler';
+
+const FIRMWARE_VERSION_KEY = 'openshock-firmware-version';
+
+async function checkPostUpdateNotification(): Promise<void> {
+  try {
+    const res = await fetch(getApiBaseUrl() + '/api/version');
+    if (!res.ok) return;
+    const data = await res.json();
+    const currentVersion: string = data.version ?? '';
+    if (!currentVersion) return;
+
+    const lastVersion = localStorage.getItem(FIRMWARE_VERSION_KEY);
+    localStorage.setItem(FIRMWARE_VERSION_KEY, currentVersion);
+
+    if (lastVersion !== null && lastVersion !== currentVersion) {
+      toast.info(`Firmware updated to v${currentVersion}`, { duration: Infinity, closeButton: true });
+    }
+  } catch {
+    // Non-fatal
+  }
+}
 
 export type MessageHandler = (wsClient: WebSocketClient, message: HubToLocalMessage) => void;
 
@@ -32,6 +54,9 @@ PayloadHandlers[HubToLocalMessagePayload.ReadyMessage] = (cli, msg) => {
   hubState.accountLinked = payload.accountLinked();
   hubState.config = mapConfig(payload.config());
 
+  // Initialise portal state from config immediately, then confirm with live fetch
+  hubState.captivePortalEnabled = hubState.config?.captivePortal?.alwaysEnabled ?? true;
+
   const gpioValidInputs = payload.gpioValidInputsArray();
   if (gpioValidInputs) {
     hubState.gpioValidInputs = gpioValidInputs;
@@ -44,7 +69,33 @@ PayloadHandlers[HubToLocalMessagePayload.ReadyMessage] = (cli, msg) => {
 
   console.log('[WS] Updated hub state: ', hubState);
 
+  checkPostUpdateNotification();
+
   stopWifiScan();
+
+  // Fetch the real WiFi enabled state from the device
+  getWifiEnabled().then((enabled) => {
+    if (enabled !== null) {
+      hubState.wifiStaEnabled = enabled;
+    }
+  });
+
+  // Fetch the real AP enabled state from the device
+  getApEnabled().then((enabled) => {
+    if (enabled !== null) {
+      hubState.wifiApEnabled = enabled;
+    }
+  });
+
+  // Fetch the real portal enabled state from the device
+  getCaptivePortalEnabled().then((enabled) => {
+    if (enabled !== null) {
+      hubState.captivePortalEnabled = enabled;
+      if (hubState.config) {
+        hubState.config.captivePortal.alwaysEnabled = enabled;
+      }
+    }
+  });
 
   toast.success('Websocket connection established');
 };

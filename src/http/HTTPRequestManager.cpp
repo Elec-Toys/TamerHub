@@ -363,6 +363,7 @@ HTTP::Response<std::size_t>
 
   HTTPClient client;
   client.setUserAgent(OpenShock::Constants::FW_USERAGENT);
+  client.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
   int64_t begin = OpenShock::millis();
 

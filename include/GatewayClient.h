@@ -40,5 +40,6 @@ namespace OpenShock {
     WebSocketsClient m_webSocket;
     GatewayClientState m_state;
     int64_t m_lastPingTimestamp;
+    int64_t m_stateSinceTimestamp;
   };
 }  // namespace OpenShock

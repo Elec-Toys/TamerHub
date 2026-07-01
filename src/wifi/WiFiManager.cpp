@@ -14,6 +14,7 @@ const char* const TAG = "WiFiManager";
 #include "wifi/WiFiScanManager.h"
 
 #include <WiFi.h>
+#include <Preferences.h>
 
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
@@ -85,11 +86,29 @@ enum class WiFiState : uint8_t {
 };
 
 static std::atomic<WiFiState> s_wifiState {WiFiState::Disconnected};
+static std::atomic<int64_t> s_lastConnectStartMs {0};
 static uint8_t s_connectedBSSID[6]                   = {0};
 static std::atomic<uint8_t> s_connectedCredentialsID = 0;
 static std::atomic<uint8_t> s_preferredCredentialsID = 0;
+static char s_preferredSsid[33]                      = {0};
 static OpenShock::SimpleMutex s_networksMutex;
 static std::vector<WiFiNetwork> s_wifiNetworks;
+
+static void refreshPreferredSsidFromPreferences()
+{
+  Preferences prefs;
+  if (!prefs.begin("oled_ui", false)) {
+    return;
+  }
+
+  String ssid = prefs.getString("def_ssid", "");
+  prefs.end();
+
+  memset(s_preferredSsid, 0, sizeof(s_preferredSsid));
+  if (!ssid.isEmpty()) {
+    strncpy(s_preferredSsid, ssid.c_str(), sizeof(s_preferredSsid) - 1);
+  }
+}
 
 static bool attractivityComparer(const WiFiNetwork& a, const WiFiNetwork& b)
 {
@@ -168,27 +187,52 @@ static bool connectWiFi(const std::string& ssid, const std::string& password, wi
     return false;
   }
 
+  // Don't attempt connection if STA is not enabled
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+    OS_LOGW(TAG, "Cannot connect: STA mode not enabled");
+    return false;
+  }
+
+  // Don't attempt if already connecting or connected
+  WiFiState currentState = s_wifiState.load(std::memory_order_relaxed);
+  if (currentState == WiFiState::Connecting || currentState == WiFiState::Connected) {
+    OS_LOGV(TAG, "Cannot connect to %s: already %s", ssid.c_str(), currentState == WiFiState::Connecting ? "connecting" : "connected");
+    return false;
+  }
+
   if (pinnedBssid != nullptr) {
     OS_LOGV(TAG, "Connecting to network %s (pinned " BSSID_FMT ")", ssid.c_str(), BSSID_ARG(pinnedBssid));
   } else {
     OS_LOGV(TAG, "Connecting to network %s", ssid.c_str());
   }
 
+  // Scan and connect cannot run reliably at the same time on this target.
+  // Abort any active scan before attempting a STA connection.
+  if (WiFiScanManager::IsScanning()) {
+    (void)WiFiScanManager::AbortScan();
+  }
+
+  // AP+STA can get channel-locked on ESP32. If AP is enabled while trying to join
+  // a network on a different channel (for example channel 13), scans/connects fail.
+  if (CaptivePortal::IsApEnabled()) {
+    OS_LOGI(TAG, "Temporarily disabling AP while connecting STA to %s", ssid.c_str());
+    CaptivePortal::SetApEnabled(false, false);
+  }
+
   // Mark as attempted and validate auth mode if we know the network from scanning
   auto it = findNetworkBySSID(ssid.c_str());
   if (it != s_wifiNetworks.end()) {
-    // Reject if the AP's auth mode is weaker than expected (evil twin protection)
-    if (expectedAuthMode != WIFI_AUTH_MAX && it->authMode < expectedAuthMode) {
-      OS_LOGW(TAG, "Rejecting network %s: auth mode %d is weaker than expected %d", ssid.c_str(), it->authMode, expectedAuthMode);
-      return false;
-    }
+    // Some APs report transitional auth modes inconsistently across scans; avoid hard reject.
     it->connectAttempts++;
     it->lastConnectAttempt = OpenShock::millis();
   }
 
   s_wifiState.store(WiFiState::Connecting, std::memory_order_relaxed);
+  s_lastConnectStartMs.store(OpenShock::millis(), std::memory_order_relaxed);
   if (WiFi.begin(ssid.c_str(), password.c_str(), 0, pinnedBssid, true) == WL_CONNECT_FAILED) {
     s_wifiState.store(WiFiState::Disconnected, std::memory_order_relaxed);
+    s_lastConnectStartMs.store(0, std::memory_order_relaxed);
     return false;
   }
 
@@ -213,6 +257,7 @@ static void evWiFiConnected(arduino_event_t* event)
   auto& info = event->event_info.wifi_sta_connected;
 
   s_wifiState.store(WiFiState::Connected, std::memory_order_relaxed);
+  s_lastConnectStartMs.store(0, std::memory_order_relaxed);
   memcpy(s_connectedBSSID, info.bssid, sizeof(s_connectedBSSID));
 
   ScopedLock lock__(&s_networksMutex);
@@ -261,6 +306,7 @@ static void evWiFiGotIP6(arduino_event_t* event)
 static void evWiFiDisconnected(arduino_event_t* event)
 {
   s_wifiState.store(WiFiState::Disconnected, std::memory_order_relaxed);
+  s_lastConnectStartMs.store(0, std::memory_order_relaxed);
   s_connectedCredentialsID.store(0, std::memory_order_relaxed);
 
   auto& info = event->event_info.wifi_sta_disconnected;
@@ -274,8 +320,7 @@ static void evWiFiDisconnected(arduino_event_t* event)
     Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Disconnected, *it, CaptivePortal::BroadcastMessageBIN);
   } else {
     // Network not in scan results (forgotten or hidden) — send minimal event
-    WiFiNetwork net;
-    memset(&net, 0, sizeof(net));
+    WiFiNetwork net {};
     strncpy(net.ssid, reinterpret_cast<const char*>(info.ssid), sizeof(net.ssid) - 1);
     memcpy(net.bssid, info.bssid, sizeof(net.bssid));
     Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Disconnected, net, CaptivePortal::BroadcastMessageBIN);
@@ -386,21 +431,98 @@ static bool tryConnect()
     }
   }
 
-  return connectWiFi(creds.ssid, creds.password, creds.authMode, creds.HasPinnedBSSID() ? creds.bssid.data() : nullptr);
+  // Prefer SSID/password reconnects; stale pinned BSSID entries can block roaming and auto-connect.
+  return connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+}
+
+static bool tryConnectFromCredentials()
+{
+  // Attempt to connect directly from saved credentials when scan results are empty.
+  // This handles cases where scanning hasn't found the network yet but we know credentials.
+  Config::WiFiCredentials creds;
+
+  // Try preferred SSID first
+  if (s_preferredSsid[0] != '\0') {
+    if (Config::TryGetWiFiCredentialsBySSID(s_preferredSsid, creds)) {
+      return connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+    }
+  }
+
+  // Try first available credential
+  bool found = Config::AnyWiFiCredentials([&creds](const Config::WiFiCredentials& c) {
+    if (c.ssid.empty()) return false;
+    creds = c;
+    return true;
+  });
+  if (found) {
+    return connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+  }
+
+  return false;
 }
 
 static void wifimanagerUpdateTask(void*)
 {
   int64_t lastScanRequest = 0;
+  int64_t lastPreferredRefresh = 0;
+  int64_t lastDirectConnectAttempt = 0;
   while (true) {
+    const int64_t now = OpenShock::millis();
+    if (lastPreferredRefresh == 0 || (now - lastPreferredRefresh) > 5000) {
+      refreshPreferredSsidFromPreferences();
+      lastPreferredRefresh = now;
+    }
+
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool staEnabled = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA);
+    if (!staEnabled) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    if (s_preferredCredentialsID.load(std::memory_order_relaxed) == 0 && s_preferredSsid[0] != '\0') {
+      const uint8_t preferredId = Config::GetWiFiCredentialsIDbySSID(s_preferredSsid);
+      if (preferredId != 0) {
+        s_preferredCredentialsID.store(preferredId, std::memory_order_relaxed);
+      }
+    }
+
+    const WiFiState state = s_wifiState.load(std::memory_order_relaxed);
+    if (state == WiFiState::Connecting) {
+      const int64_t connectStartedAt = s_lastConnectStartMs.load(std::memory_order_relaxed);
+      if (connectStartedAt > 0 && (now - connectStartedAt) > 20'000) {
+        // Recover from stuck connecting states where no disconnect event is emitted.
+        OS_LOGW(TAG, "Connection attempt timed out, resetting STA state");
+        WiFi.disconnect(false);
+        s_wifiState.store(WiFiState::Disconnected, std::memory_order_relaxed);
+        s_lastConnectStartMs.store(0, std::memory_order_relaxed);
+      }
+    }
+
     if (s_wifiState.load(std::memory_order_relaxed) == WiFiState::Disconnected && !WiFiScanManager::IsScanning()) {
       if (!tryConnect()) {
-        int64_t now = OpenShock::millis();
-        if (lastScanRequest == 0 || now - lastScanRequest > 120'000) {  // Auto-scan at boot and then every 2 mins
-          lastScanRequest = now;
-
+        // Scan results are empty or all networks are rate-limited.
+        // Try direct connect from credentials every 15 seconds.
+        if (lastDirectConnectAttempt == 0 || (now - lastDirectConnectAttempt) > 15'000) {
+          lastDirectConnectAttempt = now;
+          if (!tryConnectFromCredentials()) {
+            // No credentials at all, just scan
+            if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {  // Scan every 30s when disconnected
+              OS_LOGV(TAG, "No networks to connect to, starting scan...");
+              if (WiFiScanManager::StartScan()) {
+                lastScanRequest = now;
+              } else {
+                lastScanRequest = now - 29'000;
+              }
+            }
+          }
+        } else if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {
           OS_LOGV(TAG, "No networks to connect to, starting scan...");
-          WiFiScanManager::StartScan();
+          if (WiFiScanManager::StartScan()) {
+            lastScanRequest = now;
+          } else {
+            lastScanRequest = now - 29'000;
+          }
         }
       }
     }
@@ -430,22 +552,65 @@ bool WiFiManager::Init()
 
   WiFi.setAutoConnect(false);
   WiFi.setAutoReconnect(false);
-  WiFi.enableSTA(true);
+  // Max modem sleep: WiFi modem powers down between DTIM periods.
+  WiFi.setSleep(WIFI_PS_MAX_MODEM);
+  // Wake every 10 beacon intervals (~1 s at a 100 ms beacon) to reduce radio duty cycle.
+  {
+    wifi_config_t wifiCfg = {};
+    esp_wifi_get_config(WIFI_IF_STA, &wifiCfg);
+    wifiCfg.sta.listen_interval = 10;
+    esp_wifi_set_config(WIFI_IF_STA, &wifiCfg);
+  }
   WiFi.setHostname(hostname.c_str());
 
-  // If we recognize the network in the ESP's WiFi cache, try to connect to it
-  wifi_config_t current_conf;
-  if (esp_wifi_get_config(static_cast<wifi_interface_t>(ESP_IF_WIFI_STA), &current_conf) == ESP_OK) {
-    if (current_conf.sta.ssid[0] != '\0') {
-      if (Config::GetWiFiCredentialsIDbySSID(reinterpret_cast<const char*>(current_conf.sta.ssid)) != 0) {
-        WiFi.begin();
-      }
-    }
+  bool stationEnabled = true;
+  Preferences prefs;
+  if (prefs.begin("oled_ui", false)) {
+    stationEnabled = prefs.getBool("wifi_en", true);
+    prefs.end();
   }
+
+  refreshPreferredSsidFromPreferences();
+
+  WiFi.enableSTA(stationEnabled);
 
   if (set_esp_interface_dns(ESP_IF_WIFI_STA, IPAddress(1, 1, 1, 1), IPAddress(8, 8, 8, 8), IPAddress(9, 9, 9, 9)) != ESP_OK) {
     OS_LOGE(TAG, "Failed to set DNS servers");
     return false;
+  }
+
+  if (stationEnabled) {
+    // Try direct connect to preferred or first saved network immediately at boot.
+    // This avoids waiting for a scan to complete before connecting.
+    bool startupConnected = false;
+
+    // First, try the preferred SSID from NVS preferences
+    if (s_preferredSsid[0] != '\0') {
+      Config::WiFiCredentials creds;
+      if (Config::TryGetWiFiCredentialsBySSID(s_preferredSsid, creds)) {
+        OS_LOGI(TAG, "Auto-connecting to preferred network: %s", creds.ssid.c_str());
+        startupConnected = connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+      }
+    }
+
+    // If preferred didn't work, try the first saved credential we have
+    if (!startupConnected) {
+      Config::WiFiCredentials creds;
+      bool found = Config::AnyWiFiCredentials([&creds](const Config::WiFiCredentials& c) {
+        if (c.ssid.empty()) return false;
+        creds = c;
+        return true;
+      });
+      if (found) {
+        OS_LOGI(TAG, "Auto-connecting to saved network: %s", creds.ssid.c_str());
+        startupConnected = connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+      }
+    }
+
+    // Only start a scan if we did not initiate a connection attempt.
+    if (!startupConnected) {
+      (void)WiFiScanManager::StartScan();
+    }
   }
 
   if (TaskUtils::TaskCreateUniversal(wifimanagerUpdateTask, TAG, 4096, nullptr, 5, nullptr, 1) != pdPASS) {  // TODO: Re-profile stack usage
@@ -456,49 +621,88 @@ bool WiFiManager::Init()
   return true;
 }
 
+bool WiFiManager::IsStaEnabled()
+{
+  wifi_mode_t mode = WiFi.getMode();
+  return (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA);
+}
+
+void WiFiManager::SetStaEnabled(bool enabled)
+{
+  WiFi.enableSTA(enabled);
+
+  Preferences prefs;
+  if (prefs.begin("oled_ui", false)) {
+    prefs.putBool("wifi_en", enabled);
+    prefs.end();
+  }
+
+  if (!enabled) {
+    WiFiScanManager::AbortScan();
+    Disconnect();
+  } else {
+    // When re-enabling, try direct connect from credentials first.
+    Config::WiFiCredentials creds;
+    bool startedConnect = false;
+    if (s_preferredSsid[0] != '\0' && Config::TryGetWiFiCredentialsBySSID(s_preferredSsid, creds)) {
+      startedConnect = connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+    } else {
+      bool found = Config::AnyWiFiCredentials([&creds](const Config::WiFiCredentials& c) {
+        if (c.ssid.empty()) return false;
+        creds = c;
+        return true;
+      });
+      if (found) {
+        startedConnect = connectWiFi(creds.ssid, creds.password, creds.authMode, nullptr);
+      }
+    }
+
+    // If no immediate connection attempt is possible, scan for networks.
+    if (!startedConnect) {
+      (void)WiFiScanManager::StartScan();
+    }
+  }
+}
+
 bool WiFiManager::Save(const char* ssid, std::string_view password, bool connect, wifi_auth_mode_t authMode)
 {
   OS_LOGV(TAG, "Saving network %s (connect=%s)", ssid, connect ? "true" : "false");
 
-  ScopedLock lock__(&s_networksMutex);
+  {
+    ScopedLock lock__(&s_networksMutex);
 
-  auto it = findNetworkBySSID(ssid);
-  if (it != s_wifiNetworks.end()) {
-    // Network is in scan results — use scanned auth mode (more reliable than user-provided)
-    uint8_t id = Config::AddWiFiCredentials(it->ssid, password, it->authMode);
-    if (id == 0) {
-      Serialization::Local::SerializeErrorMessage("too_many_credentials", CaptivePortal::BroadcastMessageBIN);
-      return false;
+    auto it = findNetworkBySSID(ssid);
+    if (it != s_wifiNetworks.end()) {
+      // Network is in scan results — use scanned auth mode (more reliable than user-provided)
+      uint8_t id = Config::AddWiFiCredentials(it->ssid, password, it->authMode);
+      if (id == 0) {
+        Serialization::Local::SerializeErrorMessage("too_many_credentials", CaptivePortal::BroadcastMessageBIN);
+        return false;
+      }
+
+      it->credentialsID = id;
+      Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Saved, *it, CaptivePortal::BroadcastMessageBIN);
+    } else {
+      // Network not in scan results (hidden or out of range) — save credentials directly
+      OS_LOGI(TAG, "Network %s not in scan results, saving credentials directly", ssid);
+
+      uint8_t id = Config::AddWiFiCredentials(ssid, password, authMode);
+      if (id == 0) {
+        Serialization::Local::SerializeErrorMessage("too_many_credentials", CaptivePortal::BroadcastMessageBIN);
+        return false;
+      }
+
+      // Fire Saved event with a minimal WiFiNetwork for the UI
+      WiFiNetwork net {};
+      strncpy(net.ssid, ssid, sizeof(net.ssid) - 1);
+      net.authMode      = authMode != WIFI_AUTH_MAX ? authMode : WIFI_AUTH_OPEN;
+      net.credentialsID = id;
+      Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Saved, net, CaptivePortal::BroadcastMessageBIN);
     }
-
-    it->credentialsID = id;
-    Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Saved, *it, CaptivePortal::BroadcastMessageBIN);
-
-    if (connect) {
-      return connectWiFi(it->ssid, std::string(password));
-    }
-    return true;
   }
-
-  // Network not in scan results (hidden or out of range) — save credentials directly
-  OS_LOGI(TAG, "Network %s not in scan results, saving credentials directly", ssid);
-
-  uint8_t id = Config::AddWiFiCredentials(ssid, password, authMode);
-  if (id == 0) {
-    Serialization::Local::SerializeErrorMessage("too_many_credentials", CaptivePortal::BroadcastMessageBIN);
-    return false;
-  }
-
-  // Fire Saved event with a minimal WiFiNetwork for the UI
-  WiFiNetwork net;
-  memset(&net, 0, sizeof(net));
-  strncpy(net.ssid, ssid, sizeof(net.ssid) - 1);
-  net.authMode      = authMode != WIFI_AUTH_MAX ? authMode : WIFI_AUTH_OPEN;
-  net.credentialsID = id;
-  Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Saved, net, CaptivePortal::BroadcastMessageBIN);
 
   if (connect) {
-    s_preferredCredentialsID = id;
+    return WiFiManager::Connect(ssid);
   }
 
   return true;
@@ -508,49 +712,69 @@ bool WiFiManager::Forget(const char* ssid)
 {
   OS_LOGV(TAG, "Forgetting network %s", ssid);
 
-  ScopedLock lock__(&s_networksMutex);
+  bool shouldDisconnect = false;
+  {
+    ScopedLock lock__(&s_networksMutex);
 
-  auto it = findNetworkBySSID(ssid);
-  if (it != s_wifiNetworks.end()) {
-    uint8_t credsId = it->credentialsID;
+    auto it = findNetworkBySSID(ssid);
+    if (it != s_wifiNetworks.end()) {
+      uint8_t credsId = it->credentialsID;
 
-    // Check if the network is currently connected
-    if (credsId != 0 && s_connectedCredentialsID.load(std::memory_order_relaxed) == credsId) {
-      WiFiManager::Disconnect();
-    }
+      // Check if the network is currently connected
+      if (credsId != 0 && s_connectedCredentialsID.load(std::memory_order_relaxed) == credsId) {
+        shouldDisconnect = true;
+      }
 
-    // Remove the credentials from the config
-    if (Config::RemoveWiFiCredentials(credsId)) {
+      if (credsId != 0) {
+        // Remove the credentials from the config
+        if (!Config::RemoveWiFiCredentials(credsId)) {
+          OS_LOGE(TAG, "Failed to remove credentials ID %u for network %s", credsId, ssid);
+          return false;
+        }
+      } else {
+        // Fallback for stale/unsynced list entries: remove by SSID if credentials still exist.
+        Config::WiFiCredentials credsBySsid;
+        if (Config::TryGetWiFiCredentialsBySSID(ssid, credsBySsid) && !Config::RemoveWiFiCredentials(credsBySsid.id)) {
+          OS_LOGE(TAG, "Failed to remove fallback credentials ID %u for network %s", credsBySsid.id, ssid);
+          return false;
+        }
+      }
+
       it->credentialsID = 0;
       Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Removed, *it, CaptivePortal::BroadcastMessageBIN);
+
+      // Disconnect after releasing lock to avoid callback lock contention.
+      if (shouldDisconnect) {
+        // Delay action until after mutex scope.
+      }
+
+      // Return through unified tail path.
+    } else {
+      // Network not in scan results — look up credentials directly
+      Config::WiFiCredentials creds;
+      if (!Config::TryGetWiFiCredentialsBySSID(ssid, creds)) {
+        OS_LOGE(TAG, "Failed to find credentials for network %s", ssid);
+        return false;
+      }
+
+      // Check if the network is currently connected
+      shouldDisconnect = s_connectedCredentialsID.load(std::memory_order_relaxed) == creds.id;
+
+      if (!Config::RemoveWiFiCredentials(creds.id)) {
+        OS_LOGE(TAG, "Failed to remove credentials for network %s", ssid);
+        return false;
+      }
+
+      // Fire Removed event with a minimal WiFiNetwork for the UI
+      WiFiNetwork net {};
+      strncpy(net.ssid, ssid, sizeof(net.ssid) - 1);
+      Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Removed, net, CaptivePortal::BroadcastMessageBIN);
     }
-
-    return true;
   }
 
-  // Network not in scan results — look up credentials directly
-  Config::WiFiCredentials creds;
-  if (!Config::TryGetWiFiCredentialsBySSID(ssid, creds)) {
-    OS_LOGE(TAG, "Failed to find credentials for network %s", ssid);
-    return false;
-  }
-
-  // Check if the network is currently connected
-  if (s_connectedCredentialsID.load(std::memory_order_relaxed) == creds.id) {
-    // Disconnect from the network
+  if (shouldDisconnect) {
     WiFiManager::Disconnect();
   }
-
-  if (!Config::RemoveWiFiCredentials(creds.id)) {
-    OS_LOGE(TAG, "Failed to remove credentials for network %s", ssid);
-    return false;
-  }
-
-  // Fire Removed event with a minimal WiFiNetwork for the UI
-  WiFiNetwork net;
-  memset(&net, 0, sizeof(net));
-  strncpy(net.ssid, ssid, sizeof(net.ssid) - 1);
-  Serialization::Local::SerializeWiFiNetworkEvent(Serialization::Types::WifiNetworkEventType::Removed, net, CaptivePortal::BroadcastMessageBIN);
 
   return true;
 }
@@ -598,7 +822,7 @@ bool WiFiManager::Connect(const char* ssid)
     s_preferredCredentialsID.store(creds.id, std::memory_order_relaxed);
   }
 
-  // Already connected to this network, or reconnecting — either way, success
+  // Already connected to this network, or reconnecting - either way, success
   return true;
 }
 
@@ -609,7 +833,21 @@ void WiFiManager::Disconnect()
 
 bool WiFiManager::IsConnected()
 {
-  return s_wifiState.load(std::memory_order_relaxed) == WiFiState::Connected;
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    // Keep the cached state in sync with the driver state in case events were missed.
+    if (s_wifiState.load(std::memory_order_relaxed) != WiFiState::Connected) {
+      s_wifiState.store(WiFiState::Connected, std::memory_order_relaxed);
+    }
+    return true;
+  }
+
+  if (s_wifiState.load(std::memory_order_relaxed) == WiFiState::Connected) {
+    s_wifiState.store(WiFiState::Disconnected, std::memory_order_relaxed);
+    s_connectedCredentialsID.store(0, std::memory_order_relaxed);
+  }
+
+  return false;
 }
 bool WiFiManager::GetConnectedNetwork(OpenShock::WiFiNetwork& network)
 {
@@ -636,11 +874,33 @@ bool WiFiManager::GetConnectedNetwork(OpenShock::WiFiNetwork& network)
   ScopedLock lock__(&s_networksMutex);
 
   auto it = findNetwork([connectedId](const WiFiNetwork& net) noexcept { return net.credentialsID == connectedId; });
-  if (it == s_wifiNetworks.end()) {
+  if (it != s_wifiNetworks.end()) {
+    network = *it;
+    return true;
+  }
+
+  if (!IsConnected()) {
     return false;
   }
 
-  network = *it;
+  // Fallback path when scan cache does not contain the active BSSID.
+  network = WiFiNetwork();
+  network.credentialsID = connectedId;
+
+  auto ssid = WiFi.SSID();
+  const size_t len = std::min(static_cast<size_t>(ssid.length()), sizeof(network.ssid) - 1);
+  if (len > 0) {
+    memcpy(network.ssid, ssid.c_str(), len);
+    network.ssid[len] = '\0';
+  }
+
+  const uint8_t* bssid = WiFi.BSSID();
+  if (bssid != nullptr) {
+    memcpy(network.bssid, bssid, sizeof(network.bssid));
+  }
+
+  network.channel = WiFi.channel();
+  network.rssi = WiFi.RSSI();
 
   return true;
 }

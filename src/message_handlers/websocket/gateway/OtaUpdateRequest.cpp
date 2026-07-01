@@ -3,8 +3,10 @@
 const char* const TAG = "ServerMessageHandlers";
 
 #include "captiveportal/Manager.h"
+#include "config/Config.h"
 #include "Logging.h"
 #include "OtaUpdateManager.h"
+#include "wifi/WiFiManager.h"
 
 #include <cstdint>
 
@@ -18,26 +20,17 @@ void _Private::HandleOtaUpdateRequest(const OpenShock::Serialization::Gateway::G
     return;
   }
 
-  auto semver = msg->version();
-  if (semver == nullptr) {
-    OS_LOGE(TAG, "Version cannot be parsed");
+  Config::OtaUpdateConfig cfg;
+  if (!Config::GetOtaUpdateConfig(cfg) || !cfg.allowBackendManagement) {
+    OS_LOGW(TAG, "OTA update request ignored: backend management is disabled");
     return;
   }
 
-  std::string_view prerelease, build;
-  if (semver->prerelease() != nullptr) {
-    prerelease = std::string_view(semver->prerelease()->c_str(), semver->prerelease()->size());
-  }
-  if (semver->build() != nullptr) {
-    build = std::string_view(semver->build()->c_str(), semver->build()->size());
-  }
-
-  OpenShock::SemVer version(semver->major(), semver->minor(), semver->patch(), prerelease, build);
-
-  OS_LOGI(TAG, "OTA update requested for version %s", version.toString().c_str());  // TODO: This is abusing the SemVer::toString() method causing alot of string copies, fix this
-
-  if (!OpenShock::OtaUpdateManager::TryStartFirmwareUpdate(version)) {
-    OS_LOGE(TAG, "Failed to update firmware");  // TODO: Send error message to server
+  if (!OpenShock::WiFiManager::IsConnected()) {
+    OS_LOGW(TAG, "OTA update request ignored: no network");
     return;
   }
+
+  OS_LOGI(TAG, "Gateway triggered OTA check — checking GitHub for latest version");
+  OpenShock::OtaUpdateManager::TriggerManualCheck();
 }

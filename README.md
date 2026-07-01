@@ -1,81 +1,36 @@
-# OpenShock Espressif Firmware
+# Tamer Hub Repo
 
-[![Documentation](https://img.shields.io/badge/docs-mkdocs-blue.svg)](https://openshock.org)
-[![GitHub license](https://img.shields.io/github/license/openshock/firmware.svg)](https://raw.githubusercontent.com/openshock/firmware/master/LICENSE)
-[![GitHub Releases](https://img.shields.io/github/release/openshock/firmware.svg)](https://github.com/openshock/firmware/releases)
-[![GitHub Downloads](https://img.shields.io/github/downloads/openshock/firmware/total)](https://github.com/openshock/firmware/releases)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub-Sponsors-ff69b4)](https://github.com/sponsors/openshock)
-[![Discord](https://img.shields.io/discord/1078124408775901204)](https://discord.gg/openshock)
+A fork of the OpenShock Hub firmware, but modified with a display and physical buttons for ESP32 devices. No phone needed to use it!
 
-<table>
-  <tr>
-    <td>master</td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml/badge.svg?branch=master" alt="Build Status" /></a></td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml/badge.svg?branch=master" alt="CodeQL Status" /></a></td>
-    <td><a href="https://coveralls.io/github/openshock/firmware?branch=master"><img src="https://coveralls.io/repos/github/openshock/firmware/badge.svg?branch=master" alt="Coverage Status" /></a></td>
-  </tr>
-  <tr>
-    <td>beta</td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml/badge.svg?branch=beta" alt="Build Status" /></a></td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml/badge.svg?branch=beta" alt="CodeQL Status" /></a></td>
-    <td><a href="https://coveralls.io/github/openshock/firmware?branch=master"><img src="https://coveralls.io/repos/github/openshock/firmware/badge.svg?branch=beta" alt="Coverage Status" /></a></td>
-  </tr>
-  <tr>
-    <td>develop</td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/ci-build.yml/badge.svg?branch=develop" alt="Build Status" /></a></td>
-    <td><a href="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml"><img src="https://github.com/OpenShock/Firmware/actions/workflows/codeql.yml/badge.svg?branch=develop" alt="CodeQL Status" /></a></td>
-    <td><a href="https://coveralls.io/github/openshock/firmware?branch=master"><img src="https://coveralls.io/repos/github/openshock/firmware/badge.svg?branch=develop" alt="Coverage Status" /></a></td>
-  </tr>
-</table>
+This is an AI vibe coded development. Mistakes may have been made but it does work for its intended purpose. Just practical and fun.
 
-Espressif Firmware for OpenShock.
+## What is added
 
-Controlling shockers via Reverse engineered proprietary Sub-1 GHz Protocols.
+* Display support + on-device GUI
+* Physical button input
+* ESP32-WROOVER-focused tweaks for better reliability
 
-## Compatible Hardware
+## Original project docs
 
-You will need a ESP-32 and a 433 MHz antenna attached to it.
+Main OpenShock firmware docs are here:
+https://github.com/OpenShock/Firmware
 
-For more info about buying such hardware see here [OpenShock Wiki - Vendors: Hardware](https://wiki.openshock.org/vendors/hardware/).
+## Hardware
 
-Guide for assembly can be found here [OpenShock Wiki - DIY: Assembling](https://wiki.openshock.org/diy/assembling/)
+* ESP32 DevKit style board with at least 4MB of flash
+* Generic 433 radio
+* SH1106 or SSD1309 i2c display (selectable)
+* Buttons and rotary encoder
 
-Confirmed working boards:
+See platformio.ini for specific pinouts!
 
-- PiShock
-  - 2021 Q3
-  - 2023
-- Seeed
-  - Xiao ESP32S3
-- Wemos
-  - D1 Mini
-  - Lolin S2 Mini
-  - Lolin S3
-- OpenShock (Legacy)
-  - Core V1
-- DFRobot Firebeetle 2 ESP32-E
 
-## Flashing
 
-Refer to [OpenShock Wiki - Guides: First time setup](https://wiki.openshock.org/guides/openshock/first-setup) on how to set up your microcontroller.
+## How to use it
 
-Other than that, you can just flash via platform io in vscode. More in the contribute section.
+Just flash the app and littleFS bin files onto your board, and future updates will be automatically pulled from this repo by the device.
 
-## Contribute
+## License
 
-You will need:
+AGPLv3
 
-- VSCode
-- Knowledge about Arduino library and C++
-- Compatible ESP-32 board with 433 MHz antenna
-
-### Setting up
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## Support
-
-You can support the openshock dev team here: [Sponsor OpenShock](https://github.com/sponsors/OpenShock)

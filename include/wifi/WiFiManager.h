@@ -12,6 +12,14 @@ namespace OpenShock::WiFiManager {
   /// @return True if the WiFiManager was initialized successfully
   [[nodiscard]] bool Init();
 
+  /// @brief Returns whether WiFi STA mode is currently enabled
+  /// @return True if STA is enabled
+  bool IsStaEnabled();
+
+  /// @brief Enables or disables WiFi STA mode, persisting the state
+  /// @param enabled Whether to enable or disable STA
+  void SetStaEnabled(bool enabled);
+
   /// @brief Saves a network to the config
   /// @param ssid SSID of the network
   /// @param password Password of the network

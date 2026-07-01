@@ -13,5 +13,5 @@ void OpenShock::MessageHandlers::Server::_Private::HandleShockerCommandList(cons
     return;
   }
 
-  OpenShock::MessageHandlers::HandleShockerCommandList(cmdList);
+  OpenShock::MessageHandlers::HandleShockerCommandList(cmdList, true);
 }

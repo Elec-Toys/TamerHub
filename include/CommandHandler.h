@@ -17,7 +17,9 @@ namespace OpenShock::CommandHandler {
   gpio_num_t GetRfTxPin();
   SetGPIOResultCode SetRfTxPin(gpio_num_t txPin);
 
-  bool SetKeepAliveEnabled(bool enabled);
+  bool SetKeepAliveEnabled(bool enabled, bool persistConfig = true);
+
+  [[nodiscard]] uint8_t GetCommandIntensityMaxLimit();
 
   bool HandleCommand(ShockerModelType shockerModel, uint16_t shockerId, ShockerCommandType type, uint8_t intensity, uint16_t durationMs);
 }  // namespace OpenShock::CommandHandler

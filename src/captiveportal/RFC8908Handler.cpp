@@ -14,8 +14,23 @@ const char* const TAG = "RFC8908Handler";
 using namespace OpenShock;
 
 static const char* const captivePortalApiPath = "/captive-portal/api";
+static const char* const captivePortalWellKnownPath = "/.well-known/captive-portal";
 
-static const char* const probeRequestrefixes[] = {"/gen_204", "/generate_204", "/hotspot-detect.", "/success.", "/connecttest.", "/check_network_status.", "/canonical.", "/ncsi.txt", captivePortalApiPath};
+static const char* const probeRequestrefixes[] = {
+  "/gen_204",
+  "/generate_204",
+  "/hotspot-detect.",
+  "/success.",
+  "/connecttest.",
+  "/check_network_status.",
+  "/canonical.",
+  "/ncsi.txt",
+  "/mobile/status.php",
+  "/library/test/success.html",
+  "/fwlink",
+  captivePortalApiPath,
+  captivePortalWellKnownPath,
+};
 
 static String GetCaptivePortalUrl()
 {
@@ -36,14 +51,20 @@ void CaptivePortal::RFC8908Handler::CatchAll(AsyncWebServerRequest* request)
   AsyncWebServerResponse* response = request->beginResponse(302);
   response->addHeader(asyncsrv::T_LOCATION, GetCaptivePortalUrl());
   response->addHeader(asyncsrv::T_Cache_Control, "no-store, no-cache, must-revalidate");
-  response->addHeader("Pragma", "no-cache");
   response->addHeader("Expires", "0");
+  response->addHeader("Pragma", "no-cache");
+  response->addHeader("X-Captive-Portal", "true");
   request->send(response);
 }
 
 bool CaptivePortal::RFC8908Handler::canHandle(AsyncWebServerRequest* request) const
 {
-  if (!request->isHTTP() || request->method() != WebRequestMethod::HTTP_GET) {
+  if (!request->isHTTP()) {
+    return false;
+  }
+
+  auto method = request->method();
+  if (method != WebRequestMethod::HTTP_GET && method != WebRequestMethod::HTTP_HEAD) {
     return false;
   }
 
@@ -76,7 +97,7 @@ void CaptivePortal::RFC8908Handler::handleRequest(AsyncWebServerRequest* request
   // and only rely on this data over HTTPS if possible. On embedded devices,
   // HTTPS may be omitted for practicality, but the redirect-based captive
   // portal ensures broad OS compatibility.
-  if (url.equals(captivePortalApiPath)) {
+  if (url.equals(captivePortalApiPath) || url.equals(captivePortalWellKnownPath)) {
     OS_LOGI(TAG, "Got Captive API request");
 
     auto portalUrl = GetCaptivePortalUrl();
@@ -98,7 +119,9 @@ void CaptivePortal::RFC8908Handler::handleRequest(AsyncWebServerRequest* request
     AsyncWebServerResponse* response = request->beginResponse(200, "application/captive+json", jsonStr);
     cJSON_free(jsonStr);
 
-    response->addHeader("Cache-Control", "private");
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    response->addHeader("Pragma", "no-cache");
+    response->addHeader("Expires", "0");
     request->send(response);
     return;
   }

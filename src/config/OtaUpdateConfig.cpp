@@ -11,7 +11,7 @@ OtaUpdateConfig::OtaUpdateConfig()
   : isEnabled(true)
   , cdnDomain(OPENSHOCK_FW_CDN_DOMAIN)
   , updateChannel(OtaUpdateChannel::Stable)
-  , checkOnStartup(false)
+  , checkOnStartup(true)
   , checkPeriodically(false)
   , checkInterval(30)
   , allowBackendManagement(true)
@@ -42,7 +42,7 @@ void OtaUpdateConfig::ToDefault()
   isEnabled              = true;
   cdnDomain              = OPENSHOCK_FW_CDN_DOMAIN;
   updateChannel          = OtaUpdateChannel::Stable;
-  checkOnStartup         = false;
+  checkOnStartup         = true;
   checkPeriodically      = false;
   checkInterval          = 30;  // 30 minutes
   allowBackendManagement = true;

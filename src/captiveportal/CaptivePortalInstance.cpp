@@ -16,6 +16,12 @@ const char* const TAG = "CaptivePortalInstance";
 #include "RateLimiter.h"
 #include "message_handlers/WebSocket.h"
 #include "OtaUpdateChannel.h"
+#include "OtaUpdateManager.h"
+#include "SemVer.h"
+
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_timer.h>
 #include "serialization/WSLocal.h"
 #include "util/FnProxy.h"
 #include "util/HexUtils.h"
@@ -27,6 +33,7 @@ const char* const TAG = "CaptivePortalInstance";
 #include "serialization/_fbs/HubToLocalMessage_generated.h"
 
 #include <cJSON.h>
+#include <Preferences.h>
 #include <WiFi.h>
 
 const uint16_t HTTP_PORT                 = 80;
@@ -97,6 +104,7 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
   , m_socketDeFragger(std::bind(&CaptivePortalInstance::handleWebSocketEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
   , m_fileSystem()
   , m_dnsServer()
+  , m_dnsStarted(false)
   , m_taskHandle(nullptr)
 {
   m_socketServer.onEvent(std::bind(&WebSocketDeFragger::handler, &m_socketDeFragger, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
@@ -104,11 +112,14 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
 
   m_socketServer.enableHeartbeat(WEBSOCKET_PING_INTERVAL, WEBSOCKET_PING_TIMEOUT, WEBSOCKET_PING_RETRIES);
 
-  OS_LOGI(TAG, "Setting up DNS server");
-  bool dnsStarted = m_dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-
-  if (!dnsStarted) {
-    OS_LOGE(TAG, "Failed to start DNS server!");
+  if (CaptivePortal::IsApEnabled()) {
+    OS_LOGI(TAG, "Setting up DNS server");
+    m_dnsStarted = m_dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+    if (!m_dnsStarted) {
+      OS_LOGE(TAG, "Failed to start DNS server!");
+    }
+  } else {
+    OS_LOGI(TAG, "AP disabled, skipping DNS server startup");
   }
 
   bool fsOk = true;
@@ -142,9 +153,60 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
       request->send(200, HTTP::ContentType::JSON, hasPredefinedPins ? "{\"has_predefined_pins\":true}" : "{\"has_predefined_pins\":false}");
     });
 
+    m_webServer.on("/api/version", HTTP_GET, [](AsyncWebServerRequest* request) {
+      request->send(200, HTTP::ContentType::JSON, "{\"version\":\"" OPENSHOCK_FW_VERSION "\"}");
+    });
+
     m_webServer.on("/api/portal/close", HTTP_POST, [](AsyncWebServerRequest* request) {
       CaptivePortal::SetUserDone();
       request->send(200);
+    });
+
+    m_webServer.on("/api/portal/enabled", HTTP_GET, [](AsyncWebServerRequest* request) {
+      bool enabled = CaptivePortal::IsEnabled();
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    m_webServer.on("/api/portal/enabled", HTTP_PUT, [](AsyncWebServerRequest* request) {
+      if (!request->hasParam("enabled")) {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
+        return;
+      }
+
+      bool enabled = request->getParam("enabled")->value().toInt() != 0;
+
+      CaptivePortal::SetEnabled(enabled);
+      CaptivePortal::SetAlwaysEnabled(enabled);
+
+      if (!enabled) {
+        CaptivePortal::SetApEnabled(false);
+        (void)CaptivePortal::ForceClose(300);
+      }
+
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    m_webServer.on("/api/ap/enabled", HTTP_GET, [](AsyncWebServerRequest* request) {
+      bool enabled = CaptivePortal::IsApEnabled();
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    m_webServer.on("/api/ap/enabled", HTTP_PUT, [](AsyncWebServerRequest* request) {
+      if (!request->hasParam("enabled")) {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
+        return;
+      }
+
+      bool enabled = request->getParam("enabled")->value().toInt() != 0;
+
+      if (enabled) {
+        CaptivePortal::SetEnabled(true);
+        CaptivePortal::SetAlwaysEnabled(true);
+      }
+
+      CaptivePortal::SetApEnabled(enabled);
+
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
     });
 
     m_webServer.on("/api/wifi/scan", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -158,6 +220,21 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
         WiFiScanManager::AbortScan();
       }
       request->send(200);
+    });
+
+    m_webServer.on("/api/wifi/enabled", HTTP_GET, [](AsyncWebServerRequest* request) {
+      bool enabled = WiFiManager::IsStaEnabled();
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    m_webServer.on("/api/wifi/enabled", HTTP_PUT, [](AsyncWebServerRequest* request) {
+      if (!request->hasParam("enabled")) {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
+        return;
+      }
+      bool enabled = request->getParam("enabled")->value().toInt() != 0;
+      WiFiManager::SetStaEnabled(enabled);
+      request->send(200, HTTP::ContentType::JSON, enabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
     });
 
     m_webServer.on("/api/wifi/networks", HTTP_DELETE, [](AsyncWebServerRequest* request) {
@@ -241,6 +318,30 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
       }
       cJSON* root = cJSON_CreateObject();
       cJSON_AddNumberToObject(root, "pin", pin);
+      char* json = cJSON_PrintUnformatted(root);
+      cJSON_Delete(root);
+      if (json == nullptr) {
+        request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
+      } else {
+        request->send(200, HTTP::ContentType::JSON, json);
+        cJSON_free(json);
+      }
+    });
+
+    m_webServer.on("/api/config/rf/keepalive", HTTP_PUT, [](AsyncWebServerRequest* request) {
+      if (!request->hasParam("enabled")) {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
+        return;
+      }
+
+      bool enabled = request->getParam("enabled")->value().toInt() != 0;
+      if (!CommandHandler::SetKeepAliveEnabled(enabled)) {
+        request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
+        return;
+      }
+
+      cJSON* root = cJSON_CreateObject();
+      cJSON_AddBoolToObject(root, "enabled", enabled);
       char* json = cJSON_PrintUnformatted(root);
       cJSON_Delete(root);
       if (json == nullptr) {
@@ -349,6 +450,152 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
       request->send(200);
     });
 
+    // ── Local binary upload (drag-and-drop flash) ────────────────────────────
+    // Uses raw application/octet-stream body (NOT multipart) so the async TCP
+    // receive callback processes whole chunks rather than byte-by-byte multipart
+    // parsing, which stalled large uploads and caused ERR_CONNECTION_RESET.
+    // File type is passed as ?type=app or ?type=fs query parameter.
+    static struct {
+      bool active   = false;
+      bool started  = false;
+      bool error    = false;
+      char errorMsg[96] = {};
+    } s_upload;
+
+    m_webServer.on(
+      "/api/ota/upload", HTTP_POST,
+      // ① Response handler — called once after all body chunks arrive
+      [](AsyncWebServerRequest* request) {
+        if (!s_upload.active) {
+          request->send(400, HTTP::ContentType::JSON, "{\"error\":\"No upload\"}");
+          return;
+        }
+        if (s_upload.error) {
+          if (s_upload.started) Update.abort();
+          char errBuf[128];
+          if (s_upload.errorMsg[0] != '\0') {
+            snprintf(errBuf, sizeof(errBuf), "{\"error\":\"%s\"}", s_upload.errorMsg);
+          } else {
+            snprintf(errBuf, sizeof(errBuf), "{\"error\":\"Flash failed\"}");
+          }
+          s_upload = {};
+          request->send(400, HTTP::ContentType::JSON, errBuf);
+          return;
+        }
+        if (!Update.end(true)) {
+          OS_LOGE(TAG, "Update.end failed: %s", Update.errorString());
+          s_upload = {};
+          request->send(500, HTTP::ContentType::JSON, "{\"error\":\"Flash failed\"}");
+          return;
+        }
+        OS_LOGI(TAG, "Local OTA flash complete");
+        s_upload = {};
+        request->send(200, HTTP::ContentType::JSON, "{\"ok\":true}");
+        // Reboot 600 ms later so the response is fully sent first.
+        static esp_timer_handle_t s_rebootTimer = nullptr;
+        if (s_rebootTimer == nullptr) {
+          esp_timer_create_args_t args = {};
+          args.callback = [](void*) { esp_restart(); };
+          args.name     = "local_ota_reboot";
+          esp_timer_create(&args, &s_rebootTimer);
+        }
+        esp_timer_start_once(s_rebootTimer, 600'000);  // 600 ms in µs
+      },
+      nullptr,  // No multipart upload handler
+      // ② Raw body handler — called for every received TCP chunk (whole buffer, not byte-by-byte)
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+        if (index == 0) {
+          s_upload = {};
+          s_upload.active = true;
+
+          if (OpenShock::OtaUpdateManager::IsUpdateInProgress()) {
+            OS_LOGW(TAG, "Local upload rejected: OTA already in progress");
+            s_upload.error = true;
+            return;
+          }
+
+          const bool isFs = request->hasParam("type") && request->getParam("type")->value() == "fs";
+          const int  cmd  = isFs ? U_SPIFFS : U_FLASH;
+          const char* lbl = isFs ? "static0"  : nullptr;
+
+          OS_LOGI(TAG, "Local OTA upload: %s, size: %u bytes", isFs ? "filesystem" : "app", total);
+
+          // Pre-validate against the actual OTA partition size to give a fast, clear error.
+          if (total > 0) {
+            const esp_partition_t* otaPart = esp_ota_get_next_update_partition(nullptr);
+            const uint32_t maxOtaSize = (otaPart != nullptr) ? otaPart->size : 0;
+            if (maxOtaSize > 0 && total > maxOtaSize) {
+              snprintf(s_upload.errorMsg, sizeof(s_upload.errorMsg),
+                "File too large (%u bytes > %u max OTA slot). Upload app.bin only, not the full flash image.",
+                total, maxOtaSize);
+              OS_LOGE(TAG, "[CaptivePortalInstance] %s", s_upload.errorMsg);
+              s_upload.error = true;
+              return;
+            }
+          }
+
+          if (!Update.begin(total > 0 ? total : UPDATE_SIZE_UNKNOWN, cmd, -1, LOW, lbl)) {
+            snprintf(s_upload.errorMsg, sizeof(s_upload.errorMsg), "Update.begin failed: %s", Update.errorString());
+            OS_LOGE(TAG, "[CaptivePortalInstance] %s", s_upload.errorMsg);
+            s_upload.error = true;
+            return;
+          }
+          s_upload.started = true;
+        }
+
+        if (s_upload.error) return;
+
+        if (Update.write(data, len) != len) {
+          OS_LOGE(TAG, "Update.write failed at offset %u: %s", index, Update.errorString());
+          s_upload.error = true;
+        }
+      }
+    );
+    // ─────────────────────────────────────────────────────────────────────────
+
+    m_webServer.on("/api/ota/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+      Config::OtaUpdateConfig cfg;
+      if (!Config::GetOtaUpdateConfig(cfg)) {
+        request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
+        return;
+      }
+      char repoSlug[64] = {};
+      OpenShock::OtaUpdateManager::GetOtaRepoSlug(repoSlug, sizeof(repoSlug));
+      bool autoUpdate = false, promptUpdates = true, neverPrompt = false;
+      OpenShock::OtaUpdateManager::GetOtaUpdateSettings(autoUpdate, promptUpdates, neverPrompt);
+
+      char buf[256];
+      snprintf(buf, sizeof(buf),
+        "{\"repoSlug\":\"%s\",\"allowBackendManagement\":%s,\"promptUpdates\":%s}",
+        repoSlug,
+        cfg.allowBackendManagement ? "true" : "false",
+        promptUpdates ? "true" : "false"
+      );
+      request->send(200, HTTP::ContentType::JSON, buf);
+    });
+
+    m_webServer.on("/api/ota/install", HTTP_POST, [](AsyncWebServerRequest* request) {
+      if (!request->hasParam("version")) {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
+        return;
+      }
+      if (!OpenShock::WiFiManager::IsConnected()) {
+        request->send(503, HTTP::ContentType::JSON, "{\"error\":\"No network\"}");
+        return;
+      }
+      String verStr = request->getParam("version")->value();
+      OpenShock::SemVer version;
+      if (!OpenShock::TryParseSemVer(std::string_view(verStr.c_str(), verStr.length()), version)) {
+        request->send(400, HTTP::ContentType::JSON, "{\"error\":\"Invalid version\"}");
+        return;
+      }
+      if (!OpenShock::OtaUpdateManager::TryStartFirmwareUpdate(version)) {
+        request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
+        return;
+      }
+      request->send(200);
+    });
+
     m_webServer.on("/api/ota/enabled", HTTP_PUT, [](AsyncWebServerRequest* request) {
       if (!request->hasParam("enabled")) {
         request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
@@ -374,16 +621,25 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
         return;
       }
       String domain = request->getParam("domain")->value();
+      // Strip "https://github.com/" prefix so both full URLs and bare slugs are accepted.
+      const char* slug = domain.c_str();
+      const char* prefix = "https://github.com/";
+      if (strncmp(slug, prefix, 19) == 0) slug += 19;
+      if (slug[0] == '\0') {
+        request->send(400, HTTP::ContentType::JSON, JSON_ERR_MISSING_PARAM);
+        return;
+      }
       Config::OtaUpdateConfig cfg;
       if (!Config::GetOtaUpdateConfig(cfg)) {
         request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
         return;
       }
-      cfg.cdnDomain = std::string(domain.c_str(), domain.length());
+      cfg.cdnDomain = std::string(slug);
       if (!Config::SetOtaUpdateConfig(cfg)) {
         request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
         return;
       }
+      OpenShock::OtaUpdateManager::SetOtaRepoSlug(slug);
       request->send(200);
     });
 
@@ -465,18 +721,37 @@ CaptivePortal::CaptivePortalInstance::CaptivePortalInstance()
         request->send(500, HTTP::ContentType::JSON, JSON_ERR_INTERNAL);
         return;
       }
+      // Sync with OLED/OtaUpdateManager's NVS pref so both UIs stay in agreement.
+      bool autoUpdate = false, promptUpdates = true, neverPrompt = false;
+      OpenShock::OtaUpdateManager::GetOtaUpdateSettings(autoUpdate, promptUpdates, neverPrompt);
+      OpenShock::OtaUpdateManager::SetOtaUpdateSettings(autoUpdate, require, false);
       request->send(200);
     });
 
     m_webServer.on("/api/ota/check", HTTP_POST, [](AsyncWebServerRequest* request) {
-      // TODO: trigger OTA check - OtaUpdateManager does not yet expose a CheckForUpdates method
+      if (!OpenShock::WiFiManager::IsConnected()) {
+        request->send(503, HTTP::ContentType::JSON, "{\"error\":\"No network\"}");
+        return;
+      }
+      OpenShock::OtaUpdateManager::TriggerManualCheck();
       request->send(200);
     });
 
     // Serving the captive portal files from LittleFS
     m_webServer.serveStatic("/", m_fileSystem, "/www/", "max-age=3600").setDefaultFile("index.html").setSharedEtag(fsHash);
 
-    m_webServer.onNotFound(&RFC8908Handler::CatchAll);
+    // Catch-all: redirect every unknown request to the portal root.
+    // This ensures ALL traffic from clients on the AP ends up at the setup page,
+    // not just known OS probe paths.
+    m_webServer.onNotFound([](AsyncWebServerRequest* request) {
+      String portalUrl = String("http://") + WiFi.softAPIP().toString() + "/";
+      AsyncWebServerResponse* response = request->beginResponse(302);
+      response->addHeader("Location", portalUrl);
+      response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      response->addHeader("Pragma", "no-cache");
+      response->addHeader("Expires", "0");
+      request->send(response);
+    });
 
   } else {
     OS_LOGE(TAG, "/www/index.html or hash files not found, serving error page");
@@ -524,7 +799,9 @@ void CaptivePortal::CaptivePortalInstance::task()
 {
   while (!m_stopRequested.load(std::memory_order_relaxed)) {
     m_socketServer.loop();
-    m_dnsServer.processNextRequest();
+    if (m_dnsStarted) {
+      m_dnsServer.processNextRequest();
+    }
     vTaskDelay(pdMS_TO_TICKS(WEBSOCKET_UPDATE_INTERVAL));
   }
   vTaskDelete(nullptr);

@@ -12,9 +12,11 @@ const char* const TAG = "Config";
 
 #include <FS.h>
 #include <LittleFS.h>
+#include <esp_partition.h>
 
 #include <cJSON.h>
 
+#include <algorithm>
 #include <bitset>
 
 using namespace OpenShock;
@@ -22,6 +24,13 @@ using namespace OpenShock;
 static fs::LittleFSFS _configFS;
 static Config::RootConfig _configData;
 static ReadWriteMutex _configMutex;
+
+static const char* const CONFIG_FILE_PATH      = "/config";
+static const char* const CONFIG_FILE_TMP_PATH  = "/config.tmp";
+static const char* const CONFIG_FILE_BAK_PATH  = "/config.bak";
+static const char* const CONFIG_PARTITION_NAME = "config";
+
+static bool trySaveConfig();
 
 #define CONFIG_LOCK_READ_ACTION(retval, action)  \
   ScopedReadLock lock__(&_configMutex);          \
@@ -70,23 +79,48 @@ static bool tryDeserializeConfig(const uint8_t* buffer, std::size_t bufferLen, O
 
   return true;
 }
-static bool tryLoadConfig(TinyVec<uint8_t>& buffer)
+static bool isConfigPartitionLikelyBlank()
 {
-  File file = _configFS.open("/config", "rb");
+  const esp_partition_t* partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, CONFIG_PARTITION_NAME);
+  if (partition == nullptr) {
+    OS_LOGW(TAG, "Config partition not found while checking blank state");
+    return false;
+  }
+
+  constexpr std::size_t probeSize = 256;
+  uint8_t probe[probeSize] = {};
+
+  if (esp_partition_read(partition, 0, probe, sizeof(probe)) != ESP_OK) {
+    OS_LOGW(TAG, "Failed to probe config partition contents");
+    return false;
+  }
+
+  return std::all_of(std::begin(probe), std::end(probe), [](uint8_t b) { return b == 0xFF; });
+}
+
+static bool tryLoadConfigFile(const char* path, TinyVec<uint8_t>& buffer)
+{
+  File file = _configFS.open(path, "rb");
   if (!file) {
-    OS_LOGE(TAG, "Failed to open config file for reading");
+    OS_LOGW(TAG, "Failed to open config file for reading: %s", path);
     return false;
   }
 
   // Get file size
   std::size_t size = file.size();
+  if (size < sizeof(flatbuffers::uoffset_t)) {
+    OS_LOGW(TAG, "Config file is too small: %s", path);
+    file.close();
+    return false;
+  }
 
   // Resize buffer
   buffer.resize(size);
 
   // Read file
   if (file.read(buffer.data(), buffer.size()) != buffer.size()) {
-    OS_LOGE(TAG, "Failed to read config file, size mismatch");
+    OS_LOGE(TAG, "Failed to read config file, size mismatch: %s", path);
+    file.close();
     return false;
   }
 
@@ -94,30 +128,88 @@ static bool tryLoadConfig(TinyVec<uint8_t>& buffer)
 
   return true;
 }
-static bool tryLoadConfig()
+
+static bool tryLoadConfigFromFile(const char* path, OpenShock::Config::RootConfig& config)
 {
   TinyVec<uint8_t> buffer;
-  if (!tryLoadConfig(buffer)) {
+  if (!tryLoadConfigFile(path, buffer)) {
     return false;
   }
 
-  return tryDeserializeConfig(buffer.data(), buffer.size(), _configData);
+  return tryDeserializeConfig(buffer.data(), buffer.size(), config);
+}
+
+static bool tryLoadConfig(TinyVec<uint8_t>& buffer)
+{
+  if (tryLoadConfigFile(CONFIG_FILE_PATH, buffer)) {
+    return true;
+  }
+
+  return tryLoadConfigFile(CONFIG_FILE_BAK_PATH, buffer);
+}
+
+static bool tryLoadConfig()
+{
+  OpenShock::Config::RootConfig loaded;
+  if (tryLoadConfigFromFile(CONFIG_FILE_PATH, loaded)) {
+    _configData = std::move(loaded);
+    return true;
+  }
+
+  OS_LOGW(TAG, "Primary config failed to load, attempting backup");
+
+  if (tryLoadConfigFromFile(CONFIG_FILE_BAK_PATH, loaded)) {
+    OS_LOGW(TAG, "Recovered config from backup file");
+    _configData = std::move(loaded);
+
+    // Rewrite primary config from recovered in-memory state.
+    if (!trySaveConfig()) {
+      OS_LOGE(TAG, "Failed to rewrite primary config after backup recovery");
+    }
+
+    return true;
+  }
+
+  return false;
 }
 static bool trySaveConfig(const uint8_t* data, std::size_t dataLen)
 {
-  File file = _configFS.open("/config", "wb");
+  File file = _configFS.open(CONFIG_FILE_TMP_PATH, "wb");
   if (!file) {
-    OS_LOGE(TAG, "Failed to open config file for writing");
+    OS_LOGE(TAG, "Failed to open temp config file for writing");
     return false;
   }
 
   // Write file
   if (file.write(data, dataLen) != dataLen) {
-    OS_LOGE(TAG, "Failed to write config file");
+    OS_LOGE(TAG, "Failed to write temp config file");
+    file.close();
+    _configFS.remove(CONFIG_FILE_TMP_PATH);
     return false;
   }
 
   file.close();
+
+  if (_configFS.exists(CONFIG_FILE_BAK_PATH) && !_configFS.remove(CONFIG_FILE_BAK_PATH)) {
+    OS_LOGE(TAG, "Failed to remove stale config backup file");
+    _configFS.remove(CONFIG_FILE_TMP_PATH);
+    return false;
+  }
+
+  if (_configFS.exists(CONFIG_FILE_PATH) && !_configFS.rename(CONFIG_FILE_PATH, CONFIG_FILE_BAK_PATH)) {
+    OS_LOGE(TAG, "Failed to rotate current config into backup");
+    _configFS.remove(CONFIG_FILE_TMP_PATH);
+    return false;
+  }
+
+  if (!_configFS.rename(CONFIG_FILE_TMP_PATH, CONFIG_FILE_PATH)) {
+    OS_LOGE(TAG, "Failed to promote temp config to primary file");
+    if (_configFS.exists(CONFIG_FILE_BAK_PATH)) {
+      (void)_configFS.rename(CONFIG_FILE_BAK_PATH, CONFIG_FILE_PATH);
+    }
+    _configFS.remove(CONFIG_FILE_TMP_PATH);
+    return false;
+  }
 
   return true;
 }
@@ -136,8 +228,15 @@ void Config::Init()
 {
   CONFIG_LOCK_WRITE();
 
-  if (!_configFS.begin(true, "/config", 3, "config")) {
-    OS_PANIC(TAG, "Unable to mount config LittleFS partition!");
+  if (!_configFS.begin(false, "/config", 3, CONFIG_PARTITION_NAME)) {
+    if (isConfigPartitionLikelyBlank()) {
+      OS_LOGW(TAG, "Config partition appears blank, formatting for first use");
+      if (!_configFS.begin(true, "/config", 3, CONFIG_PARTITION_NAME)) {
+        OS_PANIC(TAG, "Unable to mount config LittleFS partition after format!");
+      }
+    } else {
+      OS_PANIC(TAG, "Unable to mount config LittleFS partition (refusing automatic format to prevent data loss)");
+    }
   }
 
   if (tryLoadConfig()) {
@@ -245,7 +344,15 @@ void Config::FactoryReset()
 
   _configData.ToDefault();
 
-  if (!_configFS.remove("/config") && _configFS.exists("/config")) {
+  if (!_configFS.remove(CONFIG_FILE_TMP_PATH) && _configFS.exists(CONFIG_FILE_TMP_PATH)) {
+    OS_PANIC(TAG, "Failed to remove temporary config file during factory reset. Recommend formatting microcontroller and re-flashing firmware");
+  }
+
+  if (!_configFS.remove(CONFIG_FILE_BAK_PATH) && _configFS.exists(CONFIG_FILE_BAK_PATH)) {
+    OS_PANIC(TAG, "Failed to remove backup config file during factory reset. Recommend formatting microcontroller and re-flashing firmware");
+  }
+
+  if (!_configFS.remove(CONFIG_FILE_PATH) && _configFS.exists(CONFIG_FILE_PATH)) {
     OS_PANIC(TAG, "Failed to remove existing config file for factory reset. Reccomend formatting microcontroller and re-flashing firmware");
   }
 
@@ -569,8 +676,7 @@ bool Config::RemoveWiFiCredentials(uint8_t id)
   for (auto it = _configData.wifi.credentialsList.begin(); it != _configData.wifi.credentialsList.end(); ++it) {
     if (it->id == id) {
       _configData.wifi.credentialsList.erase(it);
-      trySaveConfig();
-      return true;
+      return trySaveConfig();
     }
   }
 

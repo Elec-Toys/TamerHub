@@ -39,6 +39,9 @@ function ssidMapReducer(
 }
 
 class HubStateStore {
+  wifiStaEnabled = $state<boolean | null>(null);
+  wifiApEnabled = $state<boolean | null>(null);
+  captivePortalEnabled = $state<boolean | null>(null);
   wifiConnectedBSSID = $state<string | null>(null);
   wifiScanStatus = $state<WifiScanStatus | null>(null);
   wifiNetworks = $state<Map<string, WiFiNetwork>>(new Map());

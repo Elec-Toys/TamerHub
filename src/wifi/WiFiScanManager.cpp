@@ -13,8 +13,8 @@ const char* const TAG = "WiFiScanManager";
 #include <map>
 
 const uint8_t OPENSHOCK_WIFI_SCAN_MAX_CHANNEL         = 13;
-const uint32_t OPENSHOCK_WIFI_SCAN_MAX_MS_PER_CHANNEL = 300;  // Adjusting this value will affect the scan rate, but may also affect the scan results
-const uint32_t OPENSHOCK_WIFI_SCAN_TIMEOUT_MS         = 10 * 1000;
+const uint32_t OPENSHOCK_WIFI_SCAN_MAX_MS_PER_CHANNEL = 350;   // Adjusting this value will affect the scan rate, but may also affect the scan results
+const uint32_t OPENSHOCK_WIFI_SCAN_TIMEOUT_MS         = 15 * 1000;
 
 enum WiFiScanTaskNotificationFlags {
   CHANNEL_DONE  = 1 << 0,
@@ -76,26 +76,50 @@ static void handleScanError(int16_t retval)
 
 static int16_t scanChannel(uint8_t channel)
 {
-  int16_t retval = WiFi.scanNetworks(true, true, false, OPENSHOCK_WIFI_SCAN_MAX_MS_PER_CHANNEL, channel);
-  if (!isScanError(retval)) {
+  s_currentChannel = channel;
+
+  // Retry scan start up to 3 times with a short delay between attempts.
+  // This handles cases where WiFi is busy (e.g. connecting) and can't start a scan.
+  for (int attempt = 0; attempt < 3; attempt++) {
+    int16_t retval = WiFi.scanNetworks(true, true, false, OPENSHOCK_WIFI_SCAN_MAX_MS_PER_CHANNEL, channel);
+    if (!isScanError(retval)) {
+      return retval;
+    }
+
+    if (retval == WIFI_SCAN_FAILED && attempt < 2) {
+      OS_LOGW(TAG, "Scan start failed on channel %u (attempt %d), retrying...", channel, attempt + 1);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    handleScanError(retval);
     return retval;
   }
-
-  handleScanError(retval);
-
-  return retval;
+  return WIFI_SCAN_FAILED;
 }
 
 static WiFiScanStatus scanningTaskImpl()
 {
   // Start the scan on the highest channel and work our way down
   uint8_t channel = OPENSHOCK_WIFI_SCAN_MAX_CHANNEL;
+  bool startedAnyChannel = false;
 
   notifyStatusChangedHandlers(WiFiScanStatus::Started);
 
-  // Start the scan on the first channel
-  int16_t retval = scanChannel(channel);
-  if (isScanError(retval)) {
+  // Start the scan on the first available channel.
+  int16_t retval = WIFI_SCAN_FAILED;
+  while (channel > 0) {
+    retval = scanChannel(channel);
+    if (!isScanError(retval)) {
+      startedAnyChannel = true;
+      break;
+    }
+
+    OS_LOGW(TAG, "Skipping scan on channel %u due to start failure", channel);
+    --channel;
+  }
+
+  if (!startedAnyChannel) {
     return WiFiScanStatus::Error;
   }
 
@@ -126,15 +150,20 @@ static WiFiScanStatus scanningTaskImpl()
       return WiFiScanStatus::Error;
     }
 
-    // Select the next channel, or break if we're done
-    if (--channel <= 0) {
-      break;
+    // Start the next channel scan. Skip channels that fail to start.
+    bool startedNextChannel = false;
+    while (--channel > 0) {
+      retval = scanChannel(channel);
+      if (!isScanError(retval)) {
+        startedNextChannel = true;
+        break;
+      }
+
+      OS_LOGW(TAG, "Skipping scan on channel %u due to start failure", channel);
     }
 
-    // Start the scan on the next channel
-    retval = scanChannel(channel);
-    if (isScanError(retval)) {
-      return WiFiScanStatus::Error;
+    if (!startedNextChannel) {
+      break;
     }
   }
 
