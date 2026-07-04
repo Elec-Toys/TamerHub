@@ -69,7 +69,16 @@ void OpenShock::MessageHandlers::HandleShockerCommandList(const OpenShock::Seria
     }
 
     if (fromGateway) {
-      id = GatewayConnectionManager::ResolveOnlineRfId(id);
+      uint16_t mappedId = id;
+      if (!GatewayConnectionManager::ResolveOnlineRfId(id, mappedId)) {
+        // Unknown shocker ID — the cached online shocker list is stale (e.g. a shocker was
+        // just added on the backend). Refresh it immediately and retry before giving up.
+        OS_LOGW(TAG, "Shocker ID %u not found in cached online list, refreshing and retrying", id);
+        if (GatewayConnectionManager::RefreshOnlineShockers()) {
+          GatewayConnectionManager::ResolveOnlineRfId(id, mappedId);
+        }
+      }
+      id = mappedId;
     }
 
     // Keep OLED state synchronized with web-triggered commands.

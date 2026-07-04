@@ -132,10 +132,10 @@ namespace {
   constexpr uint8_t kSettingsVisibleCount = 4;
   constexpr uint8_t kSettingsItemCount = 6;
   constexpr uint8_t kShockerDetailItemCount = 5;  // name-edit, model, limit, test, delete
-  constexpr uint8_t kShockerListStaticItemCount = 2;  // keepalive toggle + add shocker
+  constexpr uint8_t kShockerListStaticItemCount = 3;  // update list + keepalive toggle + add shocker
   constexpr uint8_t kMaxShockers = 10;
   constexpr uint8_t kNetworkItemCount = 5;
-  constexpr uint8_t kSystemItemCount = 6;
+  constexpr uint8_t kSystemItemCount = 5;
   constexpr uint8_t kConnectNetworkItemCount = 3;
   constexpr uint8_t kAccountMenuMaxItemCount = 2;  // Link Account (always) + Delete Token (if token saved)
   constexpr uint8_t kUpdateItemCount = 5;
@@ -151,7 +151,9 @@ namespace {
   constexpr int kDisplayPowerPin = OPENSHOCK_OLED_POWER_PIN;
   constexpr int kLogoWidth = 128;
   constexpr int kLogoHeight = 64;
-  constexpr uint16_t kBatteryDefaultMaxMv = 4100;
+  constexpr uint16_t kBatteryNominalMaxMv = 4200;  // Typical single-cell LiPo full-charge voltage; auto-adjusts upward from here.
+  constexpr uint16_t kBatteryNominalMinMv = 3300;  // Typical single-cell LiPo empty-cutoff voltage; auto-adjusts downward from here.
+  constexpr float kBatteryDeadzoneRatio = 0.05f;  // 5% dead zone applied at both ends of the observed range.
 
   enum class PowerUiState : uint8_t {
     BootDelay,
@@ -167,8 +169,6 @@ namespace {
     System,
     SystemScreenSleepEdit,
     SystemDeviceSleepEdit,
-    BatteryCalibrationConfirmClear,
-    BatteryCalibrationConfirmCharged,
     About,
     AccountMenu,
     AccountLink,
@@ -203,15 +203,16 @@ namespace {
   bool s_lastMainWifiConnected = false;
   bool s_lastMainGwOnline = false;
   bool s_lastMainAccountLinked = false;
+  bool s_lastMainActiveShockerIsOnline = false;
+  uint8_t s_lastMainActiveShockerIdx = 0xFF;
   uint8_t s_mainBatteryPercent = 1;
   bool s_batteryInitialized = false;
   uint16_t s_batteryFilteredMv = 0;
   int64_t s_lastBatterySampleAt = 0;
   int8_t s_batteryPendingDirection = 0;
   uint8_t s_batteryPendingCount = 0;
-  uint16_t s_batteryMaxMv = kBatteryDefaultMaxMv;
-  bool s_batteryCalibrationPending = false;
-  TaskHandle_t s_batteryCalibrationTask = nullptr;
+  uint16_t s_batteryMaxMvObserved = kBatteryNominalMaxMv;
+  uint16_t s_batteryMinMvObserved = kBatteryNominalMinMv;
   // ── Main-page active shocker state ──
   bool s_activeShockerIsOnline = false;
   uint8_t s_activeShockerIdx = 0;
@@ -271,6 +272,8 @@ namespace {
     uint8_t s_shockerCount = 0;
     uint8_t s_shockerListSelection = 0;
     uint8_t s_shockerListFirstVisible = 0;
+    bool s_shockerListRefreshPending = false;
+    TaskHandle_t s_shockerListRefreshTask = nullptr;
     uint8_t s_selectedShockerIndex = 0;
     uint8_t s_selectedOnlineShockerIndex = 0;
     ShockerSelectionSource s_selectedShockerSource = ShockerSelectionSource::Local;
@@ -334,6 +337,7 @@ namespace {
   constexpr char kPrefBatteryIconEnabled[] = "bat_ic_en";
   constexpr char kPrefBatteryPctEnabled[] = "bat_pc_en";
   constexpr char kPrefBatteryMaxMv[] = "bat_max_mv";
+  constexpr char kPrefBatteryMinMv[] = "bat_min_mv";
   constexpr char kShockerPrefsNamespace[] = "shockers";
 
   constexpr std::array<std::string_view, kSettingsItemCount> kSettingsItems {
@@ -359,7 +363,6 @@ namespace {
     "Device Sleep",
     "Battery Icon",
     "Battery Level",
-    "Battery Calibration",
   };
 
   constexpr std::array<std::string_view, kConnectNetworkItemCount> kConnectNetworkItems {
@@ -394,15 +397,11 @@ namespace {
   // Link/chain icon: two interlocked rectangular links (7x7)
   constexpr std::string_view kLinkIconCode { "11770111000100010011111000011111001000100011100000000" };
   constexpr int kBatterySensePin = OPENSHOCK_BATTERY_SENSE_PIN;
-  constexpr uint16_t kBatteryMinMv = 3000;
   constexpr int64_t kBatterySamplePeriodMs = 750;
   constexpr uint8_t kBatterySamplesPerCycle = 8;
   // 625 µs × 8 samples = 5 ms = exactly one 200 Hz noise cycle → sinusoidal noise sums to zero
   constexpr uint32_t kBatterySampleDelayUs = 625;
   constexpr uint8_t kBatteryNeighborConfirmCount = 6;
-  constexpr float kBatteryCalibrationMarginRatio = 0.95f;
-  constexpr uint16_t kBatteryCalibrationSamples = 50;
-  constexpr uint32_t kBatteryCalibrationIntervalMs = 20;  // 50 * 20ms = ~1s
 
   constexpr std::array<OpenShock::ShockerModelType, 5> kProtocolOptions {
     OpenShock::ShockerModelType::CaiXianlin,
@@ -684,7 +683,7 @@ namespace {
 
   bool isHelpButtonVisibleForCurrentView()
   {
-    if (s_settingsView == SettingsView::Connect || s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerLimitEdit || s_settingsView == SettingsView::ShockerProtocolEdit || s_settingsView == SettingsView::AccountLink || s_settingsView == SettingsView::BatteryCalibrationConfirmClear || s_settingsView == SettingsView::BatteryCalibrationConfirmCharged || s_settingsView == SettingsView::UpdatePrompt || s_settingsView == SettingsView::UpdateRepoEdit) {
+    if (s_settingsView == SettingsView::Connect || s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerLimitEdit || s_settingsView == SettingsView::ShockerProtocolEdit || s_settingsView == SettingsView::AccountLink || s_settingsView == SettingsView::UpdatePrompt || s_settingsView == SettingsView::UpdateRepoEdit) {
       return false;
     }
 
@@ -745,8 +744,6 @@ namespace {
           return "Show or hide the battery icon on the main page";
         case 4:
           return "Show or hide the battery level on the main page";
-        case 5:
-          return "Recalibrate the battery percentage reading";
         default:
           return "Select an option";
       }
@@ -793,10 +790,14 @@ namespace {
 
     if (s_settingsView == SettingsView::ShockerList) {
       if (s_shockerListSelection == 0) {
-        return "Toggle RF keep-alive packets for active shockers";
+        return "Refresh the online shocker list from the backend";
       }
 
       if (s_shockerListSelection == 1) {
+        return "Toggle RF keep-alive packets for active shockers";
+      }
+
+      if (s_shockerListSelection == 2) {
         return "Create a new shocker entry";
       }
 
@@ -879,7 +880,8 @@ namespace {
     s_screenSaverEnabled = s_oledPrefs.getBool(kPrefScreenSaverEnabled, false);
     s_batteryIconEnabled = s_oledPrefs.getBool(kPrefBatteryIconEnabled, true);
     s_batteryPercentEnabled = s_oledPrefs.getBool(kPrefBatteryPctEnabled, true);
-    s_batteryMaxMv = s_oledPrefs.getUShort(kPrefBatteryMaxMv, kBatteryDefaultMaxMv);
+    s_batteryMaxMvObserved = s_oledPrefs.getUShort(kPrefBatteryMaxMv, kBatteryNominalMaxMv);
+    s_batteryMinMvObserved = s_oledPrefs.getUShort(kPrefBatteryMinMv, kBatteryNominalMinMv);
 
     OpenShock::CaptivePortal::SetApEnabled(s_networkAccessPointEnabled, false);
     OpenShock::CaptivePortal::SetEnabled(s_networkCaptivePortalEnabled);
@@ -1342,59 +1344,34 @@ namespace {
     vTaskDelete(nullptr);
   }
 
-  void keepBatteryCalibrationPopupAlive()
+  void keepShockerListRefreshPopupAlive()
   {
-    if (!s_batteryCalibrationPending) {
+    if (!s_shockerListRefreshPending) {
       return;
     }
 
-    constexpr std::string_view kCalibrating = "Calibrating...";
+    constexpr std::string_view kUpdating = "Updating List";
     const bool hasMessage = s_infoPopupMessage[0] != '\0';
-    const bool isCalibratingMessage = std::strncmp(s_infoPopupMessage, kCalibrating.data(), kCalibrating.size()) == 0;
+    const bool isUpdatingMessage = std::strncmp(s_infoPopupMessage, kUpdating.data(), kUpdating.size()) == 0;
 
-    if (!hasMessage || isCalibratingMessage) {
+    if (!hasMessage || isUpdatingMessage) {
       std::memset(s_infoPopupMessage, 0, sizeof(s_infoPopupMessage));
-      std::memcpy(s_infoPopupMessage, kCalibrating.data(), kCalibrating.size());
+      std::memcpy(s_infoPopupMessage, kUpdating.data(), kUpdating.size());
       s_infoPopupHideAt = OpenShock::millis() + 1200;
       s_infoPopupWasVisible = true;
     }
   }
 
-  void batteryCalibrationTask(void*)
+  void shockerListRefreshTask(void*)
   {
-    uint16_t measuredMv = 0;
+    const bool ok = OpenShock::GatewayConnectionManager::RefreshOnlineShockers();
 
-    if (kBatterySensePin >= 0) {
-      uint32_t rawSum = 0;
-      for (uint16_t i = 0; i < kBatteryCalibrationSamples; ++i) {
-        rawSum += static_cast<uint32_t>(analogRead(kBatterySensePin));
-        delay(kBatteryCalibrationIntervalMs);
-      }
-
-      const uint32_t rawAvg = rawSum / kBatteryCalibrationSamples;
-      const uint32_t sensedMv = (rawAvg * 3300u + 2047u) / 4095u;
-      measuredMv = static_cast<uint16_t>((sensedMv * 3u) / 2u);
-    }
-
-    if (measuredMv > kBatteryMinMv) {
-      const int calibratedMv = static_cast<int>(std::lround(measuredMv * kBatteryCalibrationMarginRatio));
-      s_batteryMaxMv = static_cast<uint16_t>(std::clamp(calibratedMv, static_cast<int>(kBatteryMinMv) + 100, 4500));
-
-      if (s_oledPrefsReady) {
-        s_oledPrefs.putUShort(kPrefBatteryMaxMv, s_batteryMaxMv);
-      }
-
-      s_batteryInitialized = false;
-      showInfoPopup("Battery calibrated");
-    } else {
-      showInfoPopup("Calibration failed");
-    }
-
-    s_batteryCalibrationPending = false;
+    s_shockerListRefreshPending = false;
+    showInfoPopup(ok ? "List updated" : "Update failed");
     s_forceRedraw.store(true, std::memory_order_relaxed);
     OpenShock::OledDisplayManager::RequestRefresh();
 
-    s_batteryCalibrationTask = nullptr;
+    s_shockerListRefreshTask = nullptr;
     vTaskDelete(nullptr);
   }
 
@@ -1519,7 +1496,7 @@ namespace {
       return s_display.getStrWidth(title) > 122;
     } else if (view == SettingsView::AccountLink) {
       return false;
-    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::BatteryCalibrationConfirmClear || view == SettingsView::BatteryCalibrationConfirmCharged || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
+    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
       return false;
     }
     else if (view == SettingsView::ShockerNameEdit || view == SettingsView::UpdateRepoEdit) {
@@ -1536,8 +1513,10 @@ namespace {
         if (idx >= ic) break;
         if (view == SettingsView::ShockerList) {
           char onlineLabel[24] = {};
-          const char* label = "Keep Alive";
+          const char* label = "Update List";
           if (idx == 1) {
+            label = "Keep Alive";
+          } else if (idx == 2) {
             label = "Add Shocker";
           } else if (idx >= kShockerListStaticItemCount) {
             const uint8_t localIndex = static_cast<uint8_t>(idx - kShockerListStaticItemCount);
@@ -1629,7 +1608,7 @@ namespace {
     s_display.drawStr(kButtonX0 + ((kButtonW - s_display.getStrWidth("Back")) / 2), kButtonY + 7, "Back");
     s_display.drawRFrame(kButtonX1, kButtonY, kButtonW, kButtonH, 2);
     s_display.drawRFrame(kButtonX2, kButtonY, kButtonW, kButtonH, 2);
-    s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Enter")) / 2), kButtonY + 7, "Enter");
+    s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Exit")) / 2), kButtonY + 7, "Exit");
     s_display.sendBuffer();
   }
 
@@ -1702,10 +1681,11 @@ namespace {
     return 0;
   }
 
-  uint8_t batteryPercentFromMv(uint16_t batteryMv)
+  uint8_t batteryPercentFromMv(uint16_t batteryMv, uint16_t usedMinMv, uint16_t usedMaxMv)
   {
-    const uint32_t clampedMv = std::clamp<uint32_t>(batteryMv, kBatteryMinMv, s_batteryMaxMv);
-    const float normalized = static_cast<float>(clampedMv - kBatteryMinMv) / static_cast<float>(s_batteryMaxMv - kBatteryMinMv);
+    const uint16_t rangeMv = (usedMaxMv > usedMinMv) ? static_cast<uint16_t>(usedMaxMv - usedMinMv) : static_cast<uint16_t>(1);
+    const uint32_t clampedMv = std::clamp<uint32_t>(batteryMv, usedMinMv, usedMaxMv);
+    const float normalized = static_cast<float>(clampedMv - usedMinMv) / static_cast<float>(rangeMv);
     const int percent = 1 + static_cast<int>(std::lround(normalized * 98.0f));
     return static_cast<uint8_t>(std::clamp(percent, 1, 99));
   }
@@ -1730,17 +1710,35 @@ namespace {
     const uint32_t rawAvg = rawSum / kBatterySamplesPerCycle;
     const uint32_t sensedMv = (rawAvg * 3300u + 2047u) / 4095u;
     const uint32_t measuredBatteryMv = (sensedMv * 3u) / 2u;
-    const uint16_t clampedBatteryMv = static_cast<uint16_t>(std::clamp<uint32_t>(measuredBatteryMv, kBatteryMinMv, s_batteryMaxMv));
+
+    // Auto-track the widest voltage range ever observed, persisting immediately so it
+    // sticks as the new bound for all future percentage calculations.
+    if (measuredBatteryMv > s_batteryMaxMvObserved) {
+      s_batteryMaxMvObserved = static_cast<uint16_t>(std::min<uint32_t>(measuredBatteryMv, 0xFFFFu));
+      if (s_oledPrefsReady) {
+        s_oledPrefs.putUShort(kPrefBatteryMaxMv, s_batteryMaxMvObserved);
+      }
+    } else if (measuredBatteryMv < s_batteryMinMvObserved) {
+      s_batteryMinMvObserved = static_cast<uint16_t>(measuredBatteryMv);
+      if (s_oledPrefsReady) {
+        s_oledPrefs.putUShort(kPrefBatteryMinMv, s_batteryMinMvObserved);
+      }
+    }
+
+    // 5% dead zone at both ends of the observed range.
+    const uint16_t usedMaxMv = static_cast<uint16_t>(std::lround(s_batteryMaxMvObserved * (1.0f - kBatteryDeadzoneRatio)));
+    const uint16_t usedMinMv = static_cast<uint16_t>(std::lround(s_batteryMinMvObserved * (1.0f + kBatteryDeadzoneRatio)));
+    const uint16_t clampedBatteryMv = static_cast<uint16_t>(std::clamp<uint32_t>(measuredBatteryMv, usedMinMv, usedMaxMv));
 
     if (!s_batteryInitialized) {
       s_batteryFilteredMv = clampedBatteryMv;
-      s_mainBatteryPercent = batteryPercentFromMv(clampedBatteryMv);
+      s_mainBatteryPercent = batteryPercentFromMv(clampedBatteryMv, usedMinMv, usedMaxMv);
       s_batteryInitialized = true;
       return true;
     }
 
     s_batteryFilteredMv = static_cast<uint16_t>((static_cast<uint32_t>(s_batteryFilteredMv) * 7u + clampedBatteryMv) / 8u);
-    const uint8_t candidatePercent = batteryPercentFromMv(s_batteryFilteredMv);
+    const uint8_t candidatePercent = batteryPercentFromMv(s_batteryFilteredMv, usedMinMv, usedMaxMv);
 
     if (candidatePercent == s_mainBatteryPercent) {
       s_batteryPendingDirection = 0;
@@ -2157,12 +2155,6 @@ namespace {
     } else if (view == SettingsView::SystemDeviceSleepEdit) {
       pageTitle = "";
       itemCount = 0;
-    } else if (view == SettingsView::BatteryCalibrationConfirmClear) {
-      pageTitle = "";
-      itemCount = 0;
-    } else if (view == SettingsView::BatteryCalibrationConfirmCharged) {
-      pageTitle = "";
-      itemCount = 0;
     } else if (view == SettingsView::About) {
       pageTitle = "About";
       itemCount = 0;
@@ -2237,7 +2229,7 @@ namespace {
       s_display.drawStr(kButtonX0 + ((kButtonW - s_display.getStrWidth("Back")) / 2), kButtonY + 7, "Back");
       s_display.drawRFrame(kButtonX1, kButtonY, kButtonW, kButtonH, 2);
       s_display.drawRFrame(kButtonX2, kButtonY, kButtonW, kButtonH, 2);
-      s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Enter")) / 2), kButtonY + 7, "Enter");
+      s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Exit")) / 2), kButtonY + 7, "Exit");
       s_display.sendBuffer();
       return;
     }
@@ -2271,7 +2263,7 @@ namespace {
       s_display.drawStr(kButtonX0 + ((kButtonW - s_display.getStrWidth("Back")) / 2), kButtonY + 7, "Back");
       s_display.drawRFrame(kButtonX1, kButtonY, kButtonW, kButtonH, 2);
       s_display.drawRFrame(kButtonX2, kButtonY, kButtonW, kButtonH, 2);
-      s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Enter")) / 2), kButtonY + 7, "Enter");
+      s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Exit")) / 2), kButtonY + 7, "Exit");
       s_display.sendBuffer();
       return;
     }
@@ -2283,16 +2275,6 @@ namespace {
 
     if (view == SettingsView::SystemDeviceSleepEdit) {
       drawSystemValueEditor("minutes");
-      return;
-    }
-
-    if (view == SettingsView::BatteryCalibrationConfirmClear) {
-      drawYesNoPromptPage("Clear", "calibration?");
-      return;
-    }
-
-    if (view == SettingsView::BatteryCalibrationConfirmCharged) {
-      drawYesNoPromptPage("Battery", "fully charged?");
       return;
     }
 
@@ -2621,6 +2603,8 @@ namespace {
         drawScrollingText(name, 24, lineYs[row], textRegionMaxX - 24);
       } else if (view == SettingsView::ShockerList) {
         if (itemIndex == 0) {
+          drawScrollingText("Update List", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
+        } else if (itemIndex == 1) {
           const int checkX = kShockerListPrefixX;
           const int checkY = lineYs[row] - 8;
           s_display.drawFrame(checkX, checkY, 8, 8);
@@ -2629,7 +2613,7 @@ namespace {
             s_display.drawLine(checkX + 6, checkY + 1, checkX + 1, checkY + 6);
           }
           drawScrollingText("Keep Alive", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
-        } else if (itemIndex == 1) {
+        } else if (itemIndex == 2) {
           drawScrollingText("Add Shocker", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
           s_display.drawStr(kShockerListPrefixX, lineYs[row], "+");
         } else {
@@ -2675,8 +2659,6 @@ namespace {
           char line[28] = {};
           std::snprintf(line, sizeof(line), "Device Sleep: %um", static_cast<unsigned>(s_deviceSleepMinutes));
           drawScrollingText(line, labelX, lineYs[row], textRegionMaxX - labelX);
-        } else {
-          drawScrollingText("Battery Calibration", labelX, lineYs[row], textRegionMaxX - labelX);
         }
       } else if (view == SettingsView::Update && (itemIndex == 1 || itemIndex == 2)) {
         // Auto Update (1) and Prompt To Update (2) have checkbox indicators.
@@ -2927,7 +2909,7 @@ namespace {
     const bool showHelp = isHelpButtonVisibleForCurrentView();
     drawButton(kButtonX0, "Back", false);
     drawButton(kButtonX1, isTextInputView ? "Done" : (showHelp ? "Help" : ""), false);
-    drawButton(kButtonX2, lockToBack ? "" : "Enter", false);
+    drawButton(kButtonX2, lockToBack ? "" : (isTextInputView ? "Delete" : "Exit"), false);
 
     s_display.sendBuffer();
   }
@@ -3235,9 +3217,9 @@ namespace {
         drawLockSymbol(64, 27, false);
       }
     } else {
-      drawMainButton(kButtonX0, "Shock", s_mainShockActive);
+      drawMainButton(kButtonX0, "Vibrate", s_mainVibrateActive);
       drawMainButton(kButtonX1, "CH", false);
-      drawMainButton(kButtonX2, "Vibrate", s_mainVibrateActive);
+      drawMainButton(kButtonX2, "Shock", s_mainShockActive);
     }
 
     // Draw persistent info popup overlay (e.g. post-update notification).
@@ -3386,8 +3368,6 @@ namespace {
           const int next = std::clamp<int>(static_cast<int>(s_pendingSystemValue) + static_cast<int>(evt.delta), 0, 1440);
           s_pendingSystemValue = static_cast<uint16_t>(next);
           changed = true;
-          continue;
-        } else if (s_settingsView == SettingsView::BatteryCalibrationConfirmClear || s_settingsView == SettingsView::BatteryCalibrationConfirmCharged) {
           continue;
         } else if (s_settingsView == SettingsView::ConnectPassword) {
           int current = static_cast<int>(s_passwordCharSelection);
@@ -3658,13 +3638,16 @@ namespace {
       const bool accountLinked = OpenShock::GatewayConnectionManager::IsLinked();
       const bool batteryChanged = updateBatterySample(now);
       const bool marqueeActive = isMainPageMarqueeActive();
-      if (s_forceRedraw.exchange(false, std::memory_order_relaxed) || marqueeActive || limit != s_lastMainLimitDrawn || wifiConnected != s_lastMainWifiConnected || wifiStrength != s_lastMainWifiStrength || gwOnline != s_lastMainGwOnline || accountLinked != s_lastMainAccountLinked || batteryChanged) {
+      const bool activeShockerChanged = s_activeShockerIsOnline != s_lastMainActiveShockerIsOnline || s_activeShockerIdx != s_lastMainActiveShockerIdx;
+      if (s_forceRedraw.exchange(false, std::memory_order_relaxed) || marqueeActive || limit != s_lastMainLimitDrawn || wifiConnected != s_lastMainWifiConnected || wifiStrength != s_lastMainWifiStrength || gwOnline != s_lastMainGwOnline || accountLinked != s_lastMainAccountLinked || batteryChanged || activeShockerChanged) {
         drawMainPage();
         s_lastMainLimitDrawn    = limit;
         s_lastMainWifiConnected = wifiConnected;
         s_lastMainWifiStrength  = wifiStrength;
         s_lastMainGwOnline      = gwOnline;
         s_lastMainAccountLinked = accountLinked;
+        s_lastMainActiveShockerIsOnline = s_activeShockerIsOnline;
+        s_lastMainActiveShockerIdx      = s_activeShockerIdx;
       }
       return;
     }
@@ -3674,7 +3657,7 @@ namespace {
 
       keepConnectingPopupAlive();
       keepAccountLinkingPopupAlive();
-      keepBatteryCalibrationPopupAlive();
+      keepShockerListRefreshPopupAlive();
 
       if (updateInfoPopupVisibility()) {
         s_forceRedraw.store(true, std::memory_order_relaxed);
@@ -3783,6 +3766,8 @@ namespace {
 }  // namespace
 
 using namespace OpenShock;
+
+static void handleMenuEnterAction();
 
 void OledDisplayManager::RunChargingModeIfNeeded(gpio_num_t encoderButtonPin)
 {
@@ -4014,19 +3999,11 @@ void OledDisplayManager::HandleEncoderButtonPressed()
     return;
   }
 
-  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && (s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::AccountLink)) {
-    if (s_settingsView == SettingsView::AccountLink) {
-      if (s_accountCodeLength > 0) {
-        --s_accountCodeLength;
-        s_accountCodeInput[s_accountCodeLength] = '\0';
-        s_forceRedraw.store(true, std::memory_order_relaxed);
-      }
-    } else if (s_passwordLength > 0) {
-      --s_passwordLength;
-      s_passwordInput[s_passwordLength] = '\0';
-      s_forceRedraw.store(true, std::memory_order_relaxed);
-    }
-    requestRefresh();
+  // Encoder is now "Enter" for the settings menu — the Power off and Update Available
+  // prompts are left unswapped, so they fall through to the page-toggle behavior below
+  // just as before.
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView != SettingsView::UpdatePrompt) {
+    handleMenuEnterAction();
     return;
   }
 
@@ -4131,11 +4108,6 @@ void OledDisplayManager::HandleLeftButtonPressed()
       } else if (s_settingsView == SettingsView::SystemScreenSleepEdit || s_settingsView == SettingsView::SystemDeviceSleepEdit) {
         s_pendingSystemValue = s_originalSystemValue;
         s_settingsView = SettingsView::System;
-      } else if (s_settingsView == SettingsView::BatteryCalibrationConfirmClear) {
-        s_settingsView = SettingsView::System;
-      } else if (s_settingsView == SettingsView::BatteryCalibrationConfirmCharged) {
-        s_settingsView = SettingsView::System;
-        showInfoPopup("Charge fully, keep charger on");
       } else if (s_settingsView == SettingsView::ShockerLimitEdit) {
         // revert limit
         s_pendingLimit = s_originalLimit;
@@ -4422,6 +4394,39 @@ void OledDisplayManager::HandleRightButtonPressed()
   }
 
   if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings) {
+    // Right is now "Delete" (backspace) on text/number entry screens.
+    if (s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::UpdateRepoEdit) {
+      if (s_passwordLength > 0) {
+        --s_passwordLength;
+        s_passwordInput[s_passwordLength] = '\0';
+        s_forceRedraw.store(true, std::memory_order_relaxed);
+      }
+      requestRefresh();
+      return;
+    }
+
+    if (s_settingsView == SettingsView::AccountLink) {
+      if (s_accountCodeLength > 0) {
+        --s_accountCodeLength;
+        s_accountCodeInput[s_accountCodeLength] = '\0';
+        s_forceRedraw.store(true, std::memory_order_relaxed);
+      }
+      requestRefresh();
+      return;
+    }
+
+    // Right is now "Exit" — leave the menu system and return to the main page.
+    s_currentPage.store(kPageMain, std::memory_order_relaxed);
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+  }
+#endif
+}
+
+void handleMenuEnterAction()
+{
+#if OPENSHOCK_OLED_ENABLED
+  {
     if (s_settingsView == SettingsView::Root) {
       if (s_settingsSelection == 0) {
         s_settingsView = SettingsView::ShockerList;
@@ -4592,35 +4597,10 @@ void OledDisplayManager::HandleRightButtonPressed()
         s_batteryPercentEnabled = !s_batteryPercentEnabled;
         saveNetworkSettingsPreferenceState();
         showInfoPopup(s_batteryPercentEnabled ? "Battery level on" : "Battery level off");
-      } else if (s_systemSelection == 5) {
-        s_settingsView = SettingsView::BatteryCalibrationConfirmClear;
       }
 
       s_forceRedraw.store(true, std::memory_order_relaxed);
       requestRefresh();
-      return;
-    }
-
-    if (s_settingsView == SettingsView::BatteryCalibrationConfirmClear) {
-      s_settingsView = SettingsView::BatteryCalibrationConfirmCharged;
-      s_forceRedraw.store(true, std::memory_order_relaxed);
-      requestRefresh();
-      return;
-    }
-
-    if (s_settingsView == SettingsView::BatteryCalibrationConfirmCharged) {
-      s_settingsView = SettingsView::System;
-      s_batteryCalibrationPending = true;
-      showInfoPopup("Calibrating...");
-      s_forceRedraw.store(true, std::memory_order_relaxed);
-      requestRefresh();
-
-      if (OpenShock::TaskUtils::TaskCreateExpensive(batteryCalibrationTask, "oled_batt_cal", 4096, nullptr, 1, &s_batteryCalibrationTask) != pdPASS) {
-        s_batteryCalibrationPending = false;
-        showInfoPopup("Calibration failed");
-        s_forceRedraw.store(true, std::memory_order_relaxed);
-        requestRefresh();
-      }
       return;
     }
 
@@ -4647,6 +4627,18 @@ void OledDisplayManager::HandleRightButtonPressed()
       const auto onlineShockers = getOnlineShockersSnapshot();
 
       if (s_shockerListSelection == 0) {
+        // Update List — explicit on-demand refresh of the online shocker list.
+        if (s_shockerListRefreshPending) {
+          showInfoPopup("Already updating");
+        } else {
+          s_shockerListRefreshPending = true;
+          showInfoPopup("Updating List");
+          if (OpenShock::TaskUtils::TaskCreateExpensive(shockerListRefreshTask, "oled_shk_refresh", 4096, nullptr, 1, &s_shockerListRefreshTask) != pdPASS) {
+            s_shockerListRefreshPending = false;
+            showInfoPopup("Update failed");
+          }
+        }
+      } else if (s_shockerListSelection == 1) {
         const bool nextState = !s_shockerKeepAliveEnabled;
         if (OpenShock::CommandHandler::SetKeepAliveEnabled(nextState)) {
           s_shockerKeepAliveEnabled = nextState;
@@ -4654,7 +4646,7 @@ void OledDisplayManager::HandleRightButtonPressed()
         } else {
           showInfoPopup("Failed to set keepalive");
         }
-      } else if (s_shockerListSelection == 1) {
+      } else if (s_shockerListSelection == 2) {
         // +Add Shocker
         if (s_shockerCount < kMaxShockers) {
           const uint8_t idx = s_shockerCount;
@@ -5091,10 +5083,10 @@ void OledDisplayManager::HandleLeftButtonDown()
   if (s_currentPage.load(std::memory_order_relaxed) == kPageMain) {
     ensureActiveMainShockerSelected();
     const uint8_t intensity = getCurrentActiveIntensity();
-    s_mainShockActive = true;
-    s_mainVibrateActive = false;
+    s_mainVibrateActive = true;
+    s_mainShockActive = false;
     s_mainCommandAutoStopAtMs = 0;
-    sendMainShockerCommand(OpenShock::ShockerCommandType::Shock, intensity);
+    sendMainShockerCommand(OpenShock::ShockerCommandType::Vibrate, intensity);
     s_forceRedraw.store(true, std::memory_order_relaxed);
     requestRefresh();
   }
@@ -5116,8 +5108,8 @@ void OledDisplayManager::HandleLeftButtonReleased()
     return;
   }
 
-  if (s_currentPage.load(std::memory_order_relaxed) == kPageMain && s_mainShockActive) {
-    s_mainShockActive = false;
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageMain && s_mainVibrateActive) {
+    s_mainVibrateActive = false;
     s_mainCommandAutoStopAtMs = 0;
     stopMainShockerCommand();
     s_forceRedraw.store(true, std::memory_order_relaxed);
@@ -5147,10 +5139,10 @@ void OledDisplayManager::HandleRightButtonDown()
   if (s_currentPage.load(std::memory_order_relaxed) == kPageMain) {
     ensureActiveMainShockerSelected();
     const uint8_t intensity = getCurrentActiveIntensity();
-    s_mainVibrateActive = true;
-    s_mainShockActive = false;
+    s_mainShockActive = true;
+    s_mainVibrateActive = false;
     s_mainCommandAutoStopAtMs = 0;
-    sendMainShockerCommand(OpenShock::ShockerCommandType::Vibrate, intensity);
+    sendMainShockerCommand(OpenShock::ShockerCommandType::Shock, intensity);
     s_forceRedraw.store(true, std::memory_order_relaxed);
     requestRefresh();
   }
@@ -5172,8 +5164,8 @@ void OledDisplayManager::HandleRightButtonReleased()
     return;
   }
 
-  if (s_currentPage.load(std::memory_order_relaxed) == kPageMain && s_mainVibrateActive) {
-    s_mainVibrateActive = false;
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageMain && s_mainShockActive) {
+    s_mainShockActive = false;
     s_mainCommandAutoStopAtMs = 0;
     stopMainShockerCommand();
     s_forceRedraw.store(true, std::memory_order_relaxed);

@@ -476,6 +476,19 @@ uint16_t GatewayConnectionManager::ResolveOnlineRfId(uint16_t sourceRfId)
   return sourceRfId;
 }
 
+bool GatewayConnectionManager::ResolveOnlineRfId(uint16_t sourceRfId, uint16_t& outMappedRfId)
+{
+  OpenShock::ScopedLock lock__(&s_onlineShockersMutex);
+  for (const auto& shocker : s_onlineShockers) {
+    if (shocker.sourceRfId == sourceRfId) {
+      outMappedRfId = shocker.mappedRfId;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool GatewayConnectionManager::IsOnlineRfIdReserved(uint16_t rfId)
 {
   OpenShock::ScopedLock lock__(&s_onlineShockersMutex);
@@ -648,6 +661,24 @@ bool FetchHubInfo(std::string authToken, bool verboseLogs)
   s_flags.fetch_or(FLAG_LINKED, std::memory_order_relaxed);
 
   return true;
+}
+
+bool GatewayConnectionManager::RefreshOnlineShockers()
+{
+  if ((s_flags.load(std::memory_order_relaxed) & FLAG_HAS_IP) == 0) {
+    return false;
+  }
+
+  if (!Config::HasBackendAuthToken()) {
+    return false;
+  }
+
+  std::string authToken;
+  if (!Config::GetBackendAuthToken(authToken)) {
+    return false;
+  }
+
+  return FetchHubInfo(std::move(authToken), false);
 }
 
 bool StartConnectingToLCG()
