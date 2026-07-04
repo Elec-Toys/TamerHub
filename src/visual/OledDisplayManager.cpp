@@ -11,6 +11,7 @@ const char* const TAG = "OledDisplayManager";
 #include "GatewayConnectionManager.h"
 #include "input/RotaryEncoderManager.h"
 #include "Logging.h"
+#include "NetworkTimeManager.h"
 #include "util/TaskUtils.h"
 #include "wifi/WiFiManager.h"
 #include "wifi/WiFiScanManager.h"
@@ -135,7 +136,7 @@ namespace {
   constexpr uint8_t kShockerListStaticItemCount = 3;  // update list + keepalive toggle + add shocker
   constexpr uint8_t kMaxShockers = 10;
   constexpr uint8_t kNetworkItemCount = 5;
-  constexpr uint8_t kSystemItemCount = 5;
+  constexpr uint8_t kSystemItemCount = 7;
   constexpr uint8_t kConnectNetworkItemCount = 3;
   constexpr uint8_t kAccountMenuMaxItemCount = 2;  // Link Account (always) + Delete Token (if token saved)
   constexpr uint8_t kUpdateItemCount = 5;
@@ -169,6 +170,7 @@ namespace {
     System,
     SystemScreenSleepEdit,
     SystemDeviceSleepEdit,
+    SystemClockOffsetEdit,
     About,
     AccountMenu,
     AccountLink,
@@ -205,6 +207,8 @@ namespace {
   bool s_lastMainAccountLinked = false;
   bool s_lastMainActiveShockerIsOnline = false;
   uint8_t s_lastMainActiveShockerIdx = 0xFF;
+  int8_t s_lastMainClockMinute = -1;
+  bool s_lastMainClockShown = false;
   uint8_t s_mainBatteryPercent = 1;
   bool s_batteryInitialized = false;
   uint16_t s_batteryFilteredMv = 0;
@@ -295,6 +299,10 @@ namespace {
   bool s_screenSaverEnabled = false;
   bool s_batteryIconEnabled = true;
   bool s_batteryPercentEnabled = true;
+  bool s_clockEnabled = false;
+  int8_t s_utcOffsetHours = 0;
+  int8_t s_pendingClockOffsetHours = 0;
+  int8_t s_originalClockOffsetHours = 0;
   uint16_t s_pendingSystemValue = 0;
   uint16_t s_originalSystemValue = 0;
   bool s_screenSleepActive = false;
@@ -338,6 +346,8 @@ namespace {
   constexpr char kPrefBatteryPctEnabled[] = "bat_pc_en";
   constexpr char kPrefBatteryMaxMv[] = "bat_max_mv";
   constexpr char kPrefBatteryMinMv[] = "bat_min_mv";
+  constexpr char kPrefClockEnabled[] = "clk_en";
+  constexpr char kPrefClockUtcOffsetHours[] = "clk_utc_off";
   constexpr char kShockerPrefsNamespace[] = "shockers";
 
   constexpr std::array<std::string_view, kSettingsItemCount> kSettingsItems {
@@ -363,6 +373,8 @@ namespace {
     "Device Sleep",
     "Battery Icon",
     "Battery Level",
+    "Clock",
+    "UTC Offset",
   };
 
   constexpr std::array<std::string_view, kConnectNetworkItemCount> kConnectNetworkItems {
@@ -744,6 +756,10 @@ namespace {
           return "Show or hide the battery icon on the main page";
         case 4:
           return "Show or hide the battery level on the main page";
+        case 5:
+          return "Show a network-synced clock on the main page";
+        case 6:
+          return "Manual hour offset applied on top of the network time";
         default:
           return "Select an option";
       }
@@ -856,6 +872,8 @@ namespace {
     s_oledPrefs.putBool(kPrefScreenSaverEnabled, s_screenSaverEnabled);
     s_oledPrefs.putBool(kPrefBatteryIconEnabled, s_batteryIconEnabled);
     s_oledPrefs.putBool(kPrefBatteryPctEnabled, s_batteryPercentEnabled);
+    s_oledPrefs.putBool(kPrefClockEnabled, s_clockEnabled);
+    s_oledPrefs.putChar(kPrefClockUtcOffsetHours, s_utcOffsetHours);
   }
 
   void loadNetworkSettingsPreferenceState()
@@ -882,6 +900,9 @@ namespace {
     s_batteryPercentEnabled = s_oledPrefs.getBool(kPrefBatteryPctEnabled, true);
     s_batteryMaxMvObserved = s_oledPrefs.getUShort(kPrefBatteryMaxMv, kBatteryNominalMaxMv);
     s_batteryMinMvObserved = s_oledPrefs.getUShort(kPrefBatteryMinMv, kBatteryNominalMinMv);
+    s_clockEnabled = s_oledPrefs.getBool(kPrefClockEnabled, false);
+    s_utcOffsetHours = s_oledPrefs.getChar(kPrefClockUtcOffsetHours, 0);
+    OpenShock::NetworkTimeManager::SetEnabled(s_clockEnabled);
 
     OpenShock::CaptivePortal::SetApEnabled(s_networkAccessPointEnabled, false);
     OpenShock::CaptivePortal::SetEnabled(s_networkCaptivePortalEnabled);
@@ -1496,7 +1517,7 @@ namespace {
       return s_display.getStrWidth(title) > 122;
     } else if (view == SettingsView::AccountLink) {
       return false;
-    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
+    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::SystemClockOffsetEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
       return false;
     }
     else if (view == SettingsView::ShockerNameEdit || view == SettingsView::UpdateRepoEdit) {
@@ -1580,15 +1601,19 @@ namespace {
     return false;
   }
 
-  void drawSystemValueEditor(const char* unitLabel)
+  void drawSystemValueEditor(const char* unitLabel, bool isSigned = false)
   {
     s_display.setDrawColor(0);
     s_display.drawRBox(9, 13, 110, 42, 4);
     s_display.setDrawColor(1);
     s_display.drawRFrame(8, 12, 110, 42, 4);
 
-    char numBuf[6];
-    std::snprintf(numBuf, sizeof(numBuf), "%u", s_pendingSystemValue);
+    char numBuf[8];
+    if (isSigned) {
+      std::snprintf(numBuf, sizeof(numBuf), "%+d", static_cast<int>(s_pendingClockOffsetHours));
+    } else {
+      std::snprintf(numBuf, sizeof(numBuf), "%u", s_pendingSystemValue);
+    }
     s_display.setFont(u8g2_font_logisoso24_tn);
     const int numW = s_display.getStrWidth(numBuf);
     s_display.drawStr((128 - numW) / 2, 39, numBuf);
@@ -2155,6 +2180,9 @@ namespace {
     } else if (view == SettingsView::SystemDeviceSleepEdit) {
       pageTitle = "";
       itemCount = 0;
+    } else if (view == SettingsView::SystemClockOffsetEdit) {
+      pageTitle = "";
+      itemCount = 0;
     } else if (view == SettingsView::About) {
       pageTitle = "About";
       itemCount = 0;
@@ -2275,6 +2303,11 @@ namespace {
 
     if (view == SettingsView::SystemDeviceSleepEdit) {
       drawSystemValueEditor("minutes");
+      return;
+    }
+
+    if (view == SettingsView::SystemClockOffsetEdit) {
+      drawSystemValueEditor("hours", true);
       return;
     }
 
@@ -2636,15 +2669,17 @@ namespace {
         getShockerDetailItem(itemIndex, detailBuf, sizeof(detailBuf));
         drawScrollingText(detailBuf, labelX, lineYs[row], textRegionMaxX - labelX);
       } else if (view == SettingsView::System) {
-        if (itemIndex == 1 || itemIndex == 3 || itemIndex == 4) {
+        if (itemIndex == 1 || itemIndex == 3 || itemIndex == 4 || itemIndex == 5) {
           const int checkX = 13;
           const int checkY = lineYs[row] - 8;
           const bool enabled = (itemIndex == 1) ? s_screenSaverEnabled :
                                (itemIndex == 3) ? s_batteryIconEnabled :
-                               s_batteryPercentEnabled;
+                               (itemIndex == 4) ? s_batteryPercentEnabled :
+                               s_clockEnabled;
           const char* label = (itemIndex == 1) ? "Screen Saver" :
                               (itemIndex == 3) ? "Battery Icon" :
-                              "Battery Level";
+                              (itemIndex == 4) ? "Battery Level" :
+                              "Clock";
           s_display.drawFrame(checkX, checkY, 8, 8);
           if (enabled) {
             s_display.drawLine(checkX + 1, checkY + 1, checkX + 6, checkY + 6);
@@ -2658,6 +2693,10 @@ namespace {
         } else if (itemIndex == 2) {
           char line[28] = {};
           std::snprintf(line, sizeof(line), "Device Sleep: %um", static_cast<unsigned>(s_deviceSleepMinutes));
+          drawScrollingText(line, labelX, lineYs[row], textRegionMaxX - labelX);
+        } else if (itemIndex == 6) {
+          char line[28] = {};
+          std::snprintf(line, sizeof(line), "UTC Offset: %+d h", static_cast<int>(s_utcOffsetHours));
           drawScrollingText(line, labelX, lineYs[row], textRegionMaxX - labelX);
         }
       } else if (view == SettingsView::Update && (itemIndex == 1 || itemIndex == 2)) {
@@ -2979,6 +3018,25 @@ namespace {
       char batteryBuf[5];
       std::snprintf(batteryBuf, sizeof(batteryBuf), "%02u%%", static_cast<unsigned>(s_mainBatteryPercent));
       s_display.drawStr(s_batteryIconEnabled ? batteryTextX : batteryIconX, 8, batteryBuf);
+    }
+
+    if (s_clockEnabled) {
+      uint8_t clockHour = 0;
+      uint8_t clockMinute = 0;
+      if (OpenShock::NetworkTimeManager::GetCurrentLocalTime(clockHour, clockMinute)) {
+        int adjustedHour = (static_cast<int>(clockHour) + static_cast<int>(s_utcOffsetHours)) % 24;
+        if (adjustedHour < 0) {
+          adjustedHour += 24;
+        }
+
+        // Top row if none of the wifi/link/battery icons are showing there, otherwise the row below.
+        const bool hasTopRowIcons = wifiConnected || s_batteryIconEnabled || s_batteryPercentEnabled;
+        const int clockY = hasTopRowIcons ? 17 : 8;
+
+        char clockBuf[6];
+        std::snprintf(clockBuf, sizeof(clockBuf), "%02d:%02u", adjustedHour, static_cast<unsigned>(clockMinute));
+        s_display.drawStr(2, clockY, clockBuf);
+      }
     }
 
     const uint8_t maxLimit = std::min<uint8_t>(getCurrentActiveIntensity(), 99);
@@ -3369,6 +3427,11 @@ namespace {
           s_pendingSystemValue = static_cast<uint16_t>(next);
           changed = true;
           continue;
+        } else if (s_settingsView == SettingsView::SystemClockOffsetEdit) {
+          const int next = std::clamp<int>(static_cast<int>(s_pendingClockOffsetHours) + static_cast<int>(evt.delta), -12, 14);
+          s_pendingClockOffsetHours = static_cast<int8_t>(next);
+          changed = true;
+          continue;
         } else if (s_settingsView == SettingsView::ConnectPassword) {
           int current = static_cast<int>(s_passwordCharSelection);
           current += static_cast<int>(evt.delta);
@@ -3639,7 +3702,13 @@ namespace {
       const bool batteryChanged = updateBatterySample(now);
       const bool marqueeActive = isMainPageMarqueeActive();
       const bool activeShockerChanged = s_activeShockerIsOnline != s_lastMainActiveShockerIsOnline || s_activeShockerIdx != s_lastMainActiveShockerIdx;
-      if (s_forceRedraw.exchange(false, std::memory_order_relaxed) || marqueeActive || limit != s_lastMainLimitDrawn || wifiConnected != s_lastMainWifiConnected || wifiStrength != s_lastMainWifiStrength || gwOnline != s_lastMainGwOnline || accountLinked != s_lastMainAccountLinked || batteryChanged || activeShockerChanged) {
+
+      uint8_t clockHour = 0;
+      uint8_t clockMinute = 0;
+      const bool clockShown = s_clockEnabled && OpenShock::NetworkTimeManager::GetCurrentLocalTime(clockHour, clockMinute);
+      const bool clockChanged = clockShown != s_lastMainClockShown || (clockShown && static_cast<int8_t>(clockMinute) != s_lastMainClockMinute);
+
+      if (s_forceRedraw.exchange(false, std::memory_order_relaxed) || marqueeActive || limit != s_lastMainLimitDrawn || wifiConnected != s_lastMainWifiConnected || wifiStrength != s_lastMainWifiStrength || gwOnline != s_lastMainGwOnline || accountLinked != s_lastMainAccountLinked || batteryChanged || activeShockerChanged || clockChanged) {
         drawMainPage();
         s_lastMainLimitDrawn    = limit;
         s_lastMainWifiConnected = wifiConnected;
@@ -3648,6 +3717,8 @@ namespace {
         s_lastMainAccountLinked = accountLinked;
         s_lastMainActiveShockerIsOnline = s_activeShockerIsOnline;
         s_lastMainActiveShockerIdx      = s_activeShockerIdx;
+        s_lastMainClockShown    = clockShown;
+        s_lastMainClockMinute   = clockShown ? static_cast<int8_t>(clockMinute) : -1;
       }
       return;
     }
@@ -4107,6 +4178,9 @@ void OledDisplayManager::HandleLeftButtonPressed()
         s_settingsView = SettingsView::ShockerDetail;
       } else if (s_settingsView == SettingsView::SystemScreenSleepEdit || s_settingsView == SettingsView::SystemDeviceSleepEdit) {
         s_pendingSystemValue = s_originalSystemValue;
+        s_settingsView = SettingsView::System;
+      } else if (s_settingsView == SettingsView::SystemClockOffsetEdit) {
+        s_pendingClockOffsetHours = s_originalClockOffsetHours;
         s_settingsView = SettingsView::System;
       } else if (s_settingsView == SettingsView::ShockerLimitEdit) {
         // revert limit
@@ -4597,6 +4671,15 @@ void handleMenuEnterAction()
         s_batteryPercentEnabled = !s_batteryPercentEnabled;
         saveNetworkSettingsPreferenceState();
         showInfoPopup(s_batteryPercentEnabled ? "Battery level on" : "Battery level off");
+      } else if (s_systemSelection == 5) {
+        s_clockEnabled = !s_clockEnabled;
+        saveNetworkSettingsPreferenceState();
+        OpenShock::NetworkTimeManager::SetEnabled(s_clockEnabled);
+        showInfoPopup(s_clockEnabled ? "Clock on" : "Clock off");
+      } else if (s_systemSelection == 6) {
+        s_originalClockOffsetHours = s_utcOffsetHours;
+        s_pendingClockOffsetHours = s_utcOffsetHours;
+        s_settingsView = SettingsView::SystemClockOffsetEdit;
       }
 
       s_forceRedraw.store(true, std::memory_order_relaxed);
@@ -4616,6 +4699,15 @@ void handleMenuEnterAction()
 
     if (s_settingsView == SettingsView::SystemDeviceSleepEdit) {
       s_deviceSleepMinutes = s_pendingSystemValue;
+      saveNetworkSettingsPreferenceState();
+      s_settingsView = SettingsView::System;
+      s_forceRedraw.store(true, std::memory_order_relaxed);
+      requestRefresh();
+      return;
+    }
+
+    if (s_settingsView == SettingsView::SystemClockOffsetEdit) {
+      s_utcOffsetHours = s_pendingClockOffsetHours;
       saveNetworkSettingsPreferenceState();
       s_settingsView = SettingsView::System;
       s_forceRedraw.store(true, std::memory_order_relaxed);

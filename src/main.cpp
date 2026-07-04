@@ -11,6 +11,7 @@ const char* const TAG = "main";
 #include "GatewayConnectionManager.h"
 #include "input/RotaryEncoderManager.h"
 #include "Logging.h"
+#include "NetworkTimeManager.h"
 #include "OtaUpdateManager.h"
 #include "serial/SerialInputHandler.h"
 #include "util/TaskUtils.h"
@@ -189,6 +190,7 @@ void main_app(void* arg)
 {
   while (true) {
     OpenShock::GatewayConnectionManager::Update();
+    OpenShock::NetworkTimeManager::Update();
 
     vTaskDelay(5);  // 5 ticks update interval
   }
