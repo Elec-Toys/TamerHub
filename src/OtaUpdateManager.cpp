@@ -34,7 +34,7 @@ const char* const TAG = "OtaUpdateManager";
 
 using namespace std::string_view_literals;
 
-#define GITHUB_DEFAULT_REPO "LevD3V/4Remote"
+#define GITHUB_DEFAULT_REPO "Elec-Toys/TamerHub"
 
 /// @brief Stops initArduino() from handling OTA rollbacks
 /// @todo Get rid of Arduino entirely. >:(
