@@ -10,6 +10,7 @@ const char* const TAG = "CaptivePortal";
 #include "Core.h"
 #include "GatewayConnectionManager.h"
 #include "Logging.h"
+#include "util/TaskUtils.h"
 #include "wifi/WiFiManager.h"
 
 #include <ESPAsyncWebServer.h>
@@ -34,6 +35,12 @@ static std::atomic<bool> s_userDone                      = false;
 static esp_timer_handle_t s_captivePortalUpdateLoopTimer = nullptr;
 static SimpleMutex s_instanceMutex;
 static std::shared_ptr<CaptivePortal::CaptivePortalInstance> s_instance = nullptr;
+
+// AP bring-up (cold WiFi radio init, AsyncWebServer/LittleFS/DNS setup) is too stack-heavy to run
+// directly on the esp_timer service task (small, shared stack) — it's deferred to this worker task.
+static TaskHandle_t s_captivePortalWorkerTask = nullptr;
+static std::atomic<bool> s_pendingStart = false;
+static std::atomic<bool> s_pendingStop  = false;
 
 // Absolute esp_timer timestamps (microseconds). 0 = not armed.
 static std::atomic<int64_t> s_startupGraceExpiry = 0;  // Don't open portal until this time passes
@@ -135,13 +142,47 @@ static void captiveportal_stop()
   WiFi.softAPdisconnect(true);
 }
 
+// Runs captiveportal_start()/captiveportal_stop() on a dedicated task with a real stack, instead
+// of inline on the caller's context (the esp_timer service task's stack is too small for a cold
+// WiFi AP bring-up + AsyncWebServer/LittleFS/DNS setup, especially when STA was never enabled to
+// warm up the WiFi driver first).
+static void captiveportal_worker_task(void*)
+{
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (s_pendingStop.exchange(false, std::memory_order_relaxed)) {
+      captiveportal_stop();
+    }
+    if (s_pendingStart.exchange(false, std::memory_order_relaxed)) {
+      captiveportal_start();
+    }
+  }
+}
+
+static void captiveportal_request_start()
+{
+  s_pendingStart.store(true, std::memory_order_relaxed);
+  if (s_captivePortalWorkerTask != nullptr) {
+    xTaskNotifyGive(s_captivePortalWorkerTask);
+  }
+}
+
+static void captiveportal_request_stop()
+{
+  s_pendingStop.store(true, std::memory_order_relaxed);
+  if (s_captivePortalWorkerTask != nullptr) {
+    xTaskNotifyGive(s_captivePortalWorkerTask);
+  }
+}
+
 static void captiveportal_updateloop(void*)
 {
   int64_t now = esp_timer_get_time();
 
   if (!s_enabled.load(std::memory_order_relaxed)) {
     if (GetInstance() != nullptr) {
-      captiveportal_stop();
+      captiveportal_request_stop();
     }
     return;
   }
@@ -157,7 +198,7 @@ static void captiveportal_updateloop(void*)
     } else {
       if (GetInstance() != nullptr) {
         OS_LOGD(TAG, "Force-closing captive portal");
-        captiveportal_stop();
+        captiveportal_request_stop();
       }
       return;
     }
@@ -166,7 +207,7 @@ static void captiveportal_updateloop(void*)
   // If always enabled, ensure portal is running and skip all grace/auto-close logic
   if (s_alwaysEnabled.load(std::memory_order_relaxed)) {
     if (GetInstance() == nullptr) {
-      captiveportal_start();
+      captiveportal_request_start();
     }
     return;
   }
@@ -191,7 +232,7 @@ static void captiveportal_updateloop(void*)
   if (s_userDone && GatewayConnectionManager::IsConnected()) {
     if (GetInstance() != nullptr) {
       OS_LOGI(TAG, "User completed setup, closing captive portal");
-      captiveportal_stop();
+      captiveportal_request_stop();
     }
     return;
   }
@@ -208,7 +249,7 @@ static void captiveportal_updateloop(void*)
         s_autoCloseExpiry.store(now + AUTO_CLOSE_DELAY_US, std::memory_order_relaxed);
       } else if (now >= expiry) {
         OS_LOGI(TAG, "Auto-closing captive portal AP (no clients for 5 minutes)");
-        captiveportal_stop();
+        captiveportal_request_stop();
         return;
       }
     }
@@ -223,30 +264,32 @@ static void captiveportal_updateloop(void*)
     bool shouldStart      = s_alwaysEnabled || !wifiConnected || !commandHandlerOk || !isDeviceFullyConfigured();
     if (shouldStart) {
       OS_LOGD(TAG, "Starting captive portal");
-      captiveportal_start();
+      captiveportal_request_start();
     }
   }
 }
 
 bool CaptivePortal::Init()
 {
-  Preferences prefs;
-  if (prefs.begin("oled_ui", false)) {
-    const bool apEnabled = prefs.getBool("ap_en", true);
-    s_apEnabled.store(apEnabled, std::memory_order_relaxed);
-    prefs.end();
-  }
-
-  Config::CaptivePortalConfig portalConfig;
-  if (Config::GetCaptivePortalConfig(portalConfig)) {
-    s_enabled.store(portalConfig.alwaysEnabled, std::memory_order_relaxed);
-    s_alwaysEnabled.store(portalConfig.alwaysEnabled, std::memory_order_relaxed);
-  }
+  // Bandaid: force AP + captive portal OFF at boot regardless of what's persisted. Booting with
+  // AP persisted on while STA was off has caused a boot crash loop; forcing both off here
+  // sidesteps that state entirely. The real persisted preference is re-applied a few seconds
+  // after boot via ApplyPersistedState(), once the rest of boot has settled.
+  s_apEnabled.store(false, std::memory_order_relaxed);
+  s_enabled.store(false, std::memory_order_relaxed);
+  s_alwaysEnabled.store(false, std::memory_order_relaxed);
 
   // If device is already fully configured, set a startup grace period before opening portal
   if (isDeviceFullyConfigured()) {
     s_startupGraceExpiry.store(esp_timer_get_time() + STARTUP_GRACE_PERIOD_US, std::memory_order_relaxed);
     OS_LOGI(TAG, "Device fully configured, startup grace period of 30s before opening portal");
+  }
+
+  // Pinned to core 1 (same as WiFiManager's own update task) — it calls WiFi.* APIs, which is fine
+  // from any core, it just shouldn't compete with the WiFi driver's internal tasks on core 0.
+  if (TaskUtils::TaskCreateUniversal(captiveportal_worker_task, "captiveportal_worker", 8192, nullptr, 1, &s_captivePortalWorkerTask, 1) != pdPASS) {
+    OS_LOGE(TAG, "Failed to create captive portal worker task");
+    return false;
   }
 
   esp_timer_create_args_t args = {
@@ -272,6 +315,26 @@ bool CaptivePortal::Init()
   }
 
   return true;
+}
+
+void CaptivePortal::ApplyPersistedState()
+{
+  bool apEnabled = true;
+  Preferences prefs;
+  if (prefs.begin("oled_ui", false)) {
+    apEnabled = prefs.getBool("ap_en", true);
+    prefs.end();
+  }
+
+  bool alwaysEnabled = false;
+  Config::CaptivePortalConfig portalConfig;
+  if (Config::GetCaptivePortalConfig(portalConfig)) {
+    alwaysEnabled = portalConfig.alwaysEnabled;
+  }
+
+  SetApEnabled(apEnabled, false);
+  SetEnabled(alwaysEnabled);
+  SetAlwaysEnabled(alwaysEnabled, false);
 }
 
 void CaptivePortal::SetEnabled(bool enabled)
@@ -300,10 +363,10 @@ void CaptivePortal::SetApEnabled(bool enabled, bool persistConfig)
   }
 
   if (GetInstance() != nullptr) {
-    captiveportal_stop();
+    captiveportal_request_stop();
 
     if (s_enabled.load(std::memory_order_relaxed)) {
-      captiveportal_start();
+      captiveportal_request_start();
     }
   } else if (!enabled) {
     WiFi.softAPdisconnect(true);

@@ -20,6 +20,11 @@ namespace OpenShock::WiFiManager {
   /// @param enabled Whether to enable or disable STA
   void SetStaEnabled(bool enabled);
 
+  /// @brief Re-applies the persisted STA-enabled state. Init() forces STA on regardless of what's
+  ///        persisted (to avoid a boot-time crash when STA was saved off while AP was on) — call
+  ///        this a few seconds after boot to restore the user's actual saved preference.
+  void ApplyPersistedStaState();
+
   /// @brief Saves a network to the config
   /// @param ssid SSID of the network
   /// @param password Password of the network

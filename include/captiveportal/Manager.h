@@ -8,6 +8,12 @@
 namespace OpenShock::CaptivePortal {
   [[nodiscard]] bool Init();
 
+  /// @brief Re-applies the persisted AP/captive-portal-enabled state. Init() forces AP + captive
+  ///        portal off regardless of what's persisted (to avoid a boot-time crash when AP was
+  ///        saved on while STA was off) — call this a few seconds after boot to restore the
+  ///        user's actual saved preference.
+  void ApplyPersistedState();
+
   void SetEnabled(bool enabled);
   bool IsEnabled();
 

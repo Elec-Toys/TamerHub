@@ -188,9 +188,22 @@ void setup()
 
 void main_app(void* arg)
 {
+  // Bandaid: WiFiManager/CaptivePortal both force safe defaults (STA on, AP+captive-portal off)
+  // at Init() regardless of what's persisted, to sidestep a boot-time crash loop caused by
+  // booting with STA off + AP on. Once the rest of boot has settled, restore the user's actual
+  // saved preference.
+  const TickType_t applyPersistedNetworkStateAt = xTaskGetTickCount() + pdMS_TO_TICKS(10'000);
+  bool appliedPersistedNetworkState              = false;
+
   while (true) {
     OpenShock::GatewayConnectionManager::Update();
     OpenShock::NetworkTimeManager::Update();
+
+    if (!appliedPersistedNetworkState && xTaskGetTickCount() >= applyPersistedNetworkStateAt) {
+      appliedPersistedNetworkState = true;
+      OpenShock::WiFiManager::ApplyPersistedStaState();
+      OpenShock::CaptivePortal::ApplyPersistedState();
+    }
 
     vTaskDelay(5);  // 5 ticks update interval
   }

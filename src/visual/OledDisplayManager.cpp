@@ -133,8 +133,23 @@ namespace {
   constexpr uint8_t kSettingsVisibleCount = 4;
   constexpr uint8_t kSettingsItemCount = 6;
   constexpr uint8_t kShockerDetailItemCount = 5;  // name-edit, model, limit, test, delete
-  constexpr uint8_t kShockerListStaticItemCount = 3;  // update list + keepalive toggle + add shocker
+  constexpr uint8_t kShockerListStaticItemCount = 4;  // update list + keepalive toggle + add shocker + create group
   constexpr uint8_t kMaxShockers = 10;
+  constexpr uint8_t kMaxGroups = 10;
+
+  struct ShockerGroupMemberRef {
+    bool isOnline;
+    uint16_t localRfId;
+    char onlineId[40];
+  };
+
+  struct ShockerGroupEntry {
+    char name[20];
+    std::vector<ShockerGroupMemberRef> members;
+    uint8_t desiredIntensity;
+  };
+
+  std::vector<ShockerGroupEntry> s_groups;
   constexpr uint8_t kNetworkItemCount = 5;
   constexpr uint8_t kSystemItemCount = 7;
   constexpr uint8_t kConnectNetworkItemCount = 3;
@@ -183,9 +198,14 @@ namespace {
     ShockerNameEdit,
     ShockerLimitEdit,
     ShockerProtocolEdit,
+    ShockerGroupDetail,
+    ShockerGroupNameEdit,
+    ShockerGroupMemberSelect,
     UpdatePrompt,
     UpdateRepoEdit,
   };
+
+  enum class MainShockerKind : uint8_t { Local, Online, Group };
 
 #if OPENSHOCK_OLED_ENABLED
   // 1.3" OLED modules are commonly SH1106 at 128x64.
@@ -205,7 +225,7 @@ namespace {
   bool s_lastMainWifiConnected = false;
   bool s_lastMainGwOnline = false;
   bool s_lastMainAccountLinked = false;
-  bool s_lastMainActiveShockerIsOnline = false;
+  MainShockerKind s_lastMainActiveShockerKind = static_cast<MainShockerKind>(0xFF);
   uint8_t s_lastMainActiveShockerIdx = 0xFF;
   int8_t s_lastMainClockMinute = -1;
   bool s_lastMainClockShown = false;
@@ -218,7 +238,7 @@ namespace {
   uint16_t s_batteryMaxMvObserved = kBatteryNominalMaxMv;
   uint16_t s_batteryMinMvObserved = kBatteryNominalMinMv;
   // ── Main-page active shocker state ──
-  bool s_activeShockerIsOnline = false;
+  MainShockerKind s_activeShockerKind = MainShockerKind::Local;
   uint8_t s_activeShockerIdx = 0;
   bool s_mainShockActive = false;
   bool s_mainVibrateActive = false;
@@ -408,6 +428,8 @@ namespace {
 
   // Link/chain icon: two interlocked rectangular links (7x7)
   constexpr std::string_view kLinkIconCode { "11770111000100010011111000011111001000100011100000000" };
+  // Group marker icon: stand-in for U+2234 (THEREFORE) — the OLED's bitmap fonts have no such glyph (7x7)
+  constexpr std::string_view kGroupIconCode { "11770000000011011001101100000000000110000011000000000" };
   constexpr int kBatterySensePin = OPENSHOCK_BATTERY_SENSE_PIN;
   constexpr int64_t kBatterySamplePeriodMs = 750;
   constexpr uint8_t kBatterySamplesPerCycle = 8;
@@ -505,8 +527,46 @@ namespace {
 
   uint8_t getTotalShockerListItemCount(const std::vector<OpenShock::GatewayConnectionManager::OnlineShockerInfo>& onlineShockers)
   {
-    const std::size_t total = kShockerListStaticItemCount + static_cast<std::size_t>(s_shockerCount) + onlineShockers.size();
+    const std::size_t total = kShockerListStaticItemCount + s_groups.size() + static_cast<std::size_t>(s_shockerCount) + onlineShockers.size();
     return static_cast<uint8_t>(std::min<std::size_t>(total, 255));
+  }
+
+  enum class ShockerListRowKind : uint8_t { UpdateList, KeepAlive, AddShocker, CreateGroup, Group, Local, Online };
+
+  struct ShockerListRow {
+    ShockerListRowKind kind;
+    uint8_t index;
+  };
+
+  // Row layout: [Update List, Keep Alive, Add Shocker, Create Group] then Groups, then Local shockers, then Online shockers.
+  ShockerListRow resolveShockerListRow(uint8_t itemIndex)
+  {
+    if (itemIndex == 0) {
+      return { ShockerListRowKind::UpdateList, 0 };
+    }
+    if (itemIndex == 1) {
+      return { ShockerListRowKind::KeepAlive, 0 };
+    }
+    if (itemIndex == 2) {
+      return { ShockerListRowKind::AddShocker, 0 };
+    }
+    if (itemIndex == 3) {
+      return { ShockerListRowKind::CreateGroup, 0 };
+    }
+
+    uint8_t rest = static_cast<uint8_t>(itemIndex - kShockerListStaticItemCount);
+    const uint8_t groupCount = static_cast<uint8_t>(std::min<std::size_t>(s_groups.size(), 255));
+    if (rest < groupCount) {
+      return { ShockerListRowKind::Group, rest };
+    }
+
+    rest = static_cast<uint8_t>(rest - groupCount);
+    if (rest < s_shockerCount) {
+      return { ShockerListRowKind::Local, rest };
+    }
+
+    rest = static_cast<uint8_t>(rest - s_shockerCount);
+    return { ShockerListRowKind::Online, rest };
   }
 
   void updateGatewayLocalRfReservations()
@@ -622,6 +682,221 @@ namespace {
   }
   // ────────────────────────
 
+  // ── Shocker group state ──
+  constexpr uint8_t kShockerGroupDetailStaticItemCount = 4;  // name, test, add/remove, delete
+  constexpr char kGroupPrefsNamespace[] = "shockergrp";
+
+  uint8_t s_selectedGroupIndex = 0;
+  uint8_t s_groupDetailSelection = 0;
+  uint8_t s_groupDetailFirstVisible = 0;
+  uint8_t s_groupMemberSelectSelection = 0;
+  uint8_t s_groupMemberSelectFirstVisible = 0;
+  char s_groupNameBackup[20] = {};
+  // ──────────────────────────
+
+  void saveGroupPrefs()
+  {
+    Preferences p;
+    if (!p.begin(kGroupPrefsNamespace, false)) {
+      return;
+    }
+
+    p.clear();
+    p.putUChar("count", static_cast<uint8_t>(std::min<std::size_t>(s_groups.size(), kMaxGroups)));
+    for (uint8_t i = 0; i < s_groups.size() && i < kMaxGroups; ++i) {
+      char nameKey[8], cntKey[8];
+      std::snprintf(nameKey, sizeof(nameKey), "gn%u", i);
+      std::snprintf(cntKey, sizeof(cntKey), "gc%u", i);
+      p.putString(nameKey, s_groups[i].name);
+      p.putUChar(cntKey, static_cast<uint8_t>(std::min<std::size_t>(s_groups[i].members.size(), 255)));
+
+      for (uint8_t j = 0; j < s_groups[i].members.size() && j < 255; ++j) {
+        char onKey[12], rfKey[12], idKey[12];
+        std::snprintf(onKey, sizeof(onKey), "go%u_%u", i, j);
+        std::snprintf(rfKey, sizeof(rfKey), "gr%u_%u", i, j);
+        std::snprintf(idKey, sizeof(idKey), "gi%u_%u", i, j);
+        const auto& m = s_groups[i].members[j];
+        p.putUChar(onKey, m.isOnline ? 1 : 0);
+        p.putUShort(rfKey, m.localRfId);
+        p.putString(idKey, m.onlineId);
+      }
+    }
+    p.end();
+  }
+
+  void loadGroupPrefs()
+  {
+    Preferences p;
+    if (!p.begin(kGroupPrefsNamespace, true)) {
+      return;
+    }
+
+    s_groups.clear();
+    const uint8_t count = std::min<uint8_t>(p.getUChar("count", 0), kMaxGroups);
+    for (uint8_t i = 0; i < count; ++i) {
+      char nameKey[8], cntKey[8];
+      std::snprintf(nameKey, sizeof(nameKey), "gn%u", i);
+      std::snprintf(cntKey, sizeof(cntKey), "gc%u", i);
+
+      ShockerGroupEntry group {};
+      String n = p.getString(nameKey, "");
+      std::strncpy(group.name, n.c_str(), sizeof(group.name) - 1);
+
+      const uint8_t memberCount = p.getUChar(cntKey, 0);
+      for (uint8_t j = 0; j < memberCount; ++j) {
+        char onKey[12], rfKey[12], idKey[12];
+        std::snprintf(onKey, sizeof(onKey), "go%u_%u", i, j);
+        std::snprintf(rfKey, sizeof(rfKey), "gr%u_%u", i, j);
+        std::snprintf(idKey, sizeof(idKey), "gi%u_%u", i, j);
+
+        ShockerGroupMemberRef member {};
+        member.isOnline = p.getUChar(onKey, 0) != 0;
+        member.localRfId = p.getUShort(rfKey, 0);
+        String onlineId = p.getString(idKey, "");
+        std::strncpy(member.onlineId, onlineId.c_str(), sizeof(member.onlineId) - 1);
+        group.members.push_back(member);
+      }
+
+      s_groups.push_back(std::move(group));
+    }
+    p.end();
+  }
+
+  void generateNextGroupName(char* buf, std::size_t bufLen)
+  {
+    for (uint32_t n = 1; n <= 999; ++n) {
+      char candidate[20];
+      std::snprintf(candidate, sizeof(candidate), "Group%u", static_cast<unsigned>(n));
+
+      bool used = false;
+      for (const auto& g : s_groups) {
+        if (std::strncmp(g.name, candidate, sizeof(g.name)) == 0) {
+          used = true;
+          break;
+        }
+      }
+
+      if (!used) {
+        std::strncpy(buf, candidate, bufLen - 1);
+        buf[bufLen - 1] = '\0';
+        return;
+      }
+    }
+
+    std::strncpy(buf, "Group", bufLen - 1);
+    buf[bufLen - 1] = '\0';
+  }
+
+  int findGroupMemberIndex(const ShockerGroupEntry& group, bool isOnline, uint16_t localRfId, const char* onlineId)
+  {
+    for (std::size_t i = 0; i < group.members.size(); ++i) {
+      const auto& m = group.members[i];
+      if (m.isOnline != isOnline) {
+        continue;
+      }
+      if (isOnline) {
+        if (std::strncmp(m.onlineId, onlineId, sizeof(m.onlineId)) == 0) {
+          return static_cast<int>(i);
+        }
+      } else if (m.localRfId == localRfId) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  }
+
+  bool isInsideShockerSection()
+  {
+    switch (s_settingsView) {
+      case SettingsView::ShockerList:
+      case SettingsView::ShockerDetail:
+      case SettingsView::ShockerNameEdit:
+      case SettingsView::ShockerLimitEdit:
+      case SettingsView::ShockerProtocolEdit:
+      case SettingsView::ShockerGroupDetail:
+      case SettingsView::ShockerGroupNameEdit:
+      case SettingsView::ShockerGroupMemberSelect:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Deletes groups with <=1 member, unless the user is still browsing the Shockers
+  // section (so a freshly-created empty group survives while being populated).
+  bool pruneShrunkGroupsIfAllowed()
+  {
+    if (isInsideShockerSection()) {
+      return false;
+    }
+
+    const std::size_t before = s_groups.size();
+    s_groups.erase(std::remove_if(s_groups.begin(), s_groups.end(), [](const ShockerGroupEntry& g) { return g.members.size() <= 1; }), s_groups.end());
+    return s_groups.size() != before;
+  }
+
+  void removeLocalMemberFromAllGroups(uint16_t rfId)
+  {
+    bool anyRemoved = false;
+    for (auto& g : s_groups) {
+      const std::size_t before = g.members.size();
+      g.members.erase(
+        std::remove_if(g.members.begin(), g.members.end(), [&](const ShockerGroupMemberRef& m) { return !m.isOnline && m.localRfId == rfId; }),
+        g.members.end()
+      );
+      if (g.members.size() != before) {
+        anyRemoved = true;
+      }
+    }
+
+    if (anyRemoved) {
+      pruneShrunkGroupsIfAllowed();
+      saveGroupPrefs();
+    }
+  }
+
+  // Strips group members whose online shocker id is no longer present in the live
+  // online list, then prunes any group that shrank to <=1 member (grace-period gated).
+  void reconcileGroupsWithOnlineList()
+  {
+    if (s_groups.empty()) {
+      return;
+    }
+
+    const auto online = getOnlineShockersSnapshot();
+    std::vector<std::string> currentIds;
+    currentIds.reserve(online.size());
+    for (const auto& o : online) {
+      currentIds.push_back(o.id);
+    }
+
+    bool anyMemberRemoved = false;
+    for (auto& g : s_groups) {
+      const std::size_t before = g.members.size();
+      g.members.erase(
+        std::remove_if(
+          g.members.begin(), g.members.end(),
+          [&](const ShockerGroupMemberRef& m) {
+            if (!m.isOnline) {
+              return false;
+            }
+            return std::find(currentIds.begin(), currentIds.end(), std::string(m.onlineId)) == currentIds.end();
+          }
+        ),
+        g.members.end()
+      );
+      if (g.members.size() != before) {
+        anyMemberRemoved = true;
+      }
+    }
+
+    if (anyMemberRemoved) {
+      pruneShrunkGroupsIfAllowed();
+      saveGroupPrefs();
+    }
+  }
+  // ────────────────────────
+
   // Returns the label for a shocker detail row
   uint8_t getShockerDetailItemCount()
   {
@@ -693,9 +968,168 @@ namespace {
     }
   }
 
+  // ── Shocker group detail / member-select helpers ──
+  void getGroupMemberDisplayName(const ShockerGroupMemberRef& member, char* buf, uint8_t bufLen)
+  {
+    if (member.isOnline) {
+      const auto onlineShockers = getOnlineShockersSnapshot();
+      for (const auto& o : onlineShockers) {
+        if (o.id == member.onlineId) {
+          std::strncpy(buf, o.displayName.c_str(), bufLen - 1);
+          buf[bufLen - 1] = '\0';
+          return;
+        }
+      }
+      std::strncpy(buf, "(unavailable)", bufLen - 1);
+      buf[bufLen - 1] = '\0';
+      return;
+    }
+
+    for (uint8_t i = 0; i < s_shockerCount; ++i) {
+      if (s_shockers[i].rfId == member.localRfId) {
+        std::strncpy(buf, s_shockers[i].name, bufLen - 1);
+        buf[bufLen - 1] = '\0';
+        return;
+      }
+    }
+    std::strncpy(buf, "(removed)", bufLen - 1);
+    buf[bufLen - 1] = '\0';
+  }
+
+  uint8_t getShockerGroupDetailItemCount()
+  {
+    if (s_selectedGroupIndex >= s_groups.size()) {
+      return kShockerGroupDetailStaticItemCount;
+    }
+    return static_cast<uint8_t>(kShockerGroupDetailStaticItemCount + std::min<std::size_t>(s_groups[s_selectedGroupIndex].members.size(), 255 - kShockerGroupDetailStaticItemCount));
+  }
+
+  const char* getSelectedGroupName()
+  {
+    if (s_selectedGroupIndex >= s_groups.size()) {
+      return "Unavailable";
+    }
+    return s_groups[s_selectedGroupIndex].name;
+  }
+
+  void getShockerGroupDetailItem(uint8_t row, char* buf, uint8_t bufLen)
+  {
+    if (s_selectedGroupIndex >= s_groups.size()) {
+      std::strncpy(buf, "Unavailable", bufLen - 1);
+      buf[bufLen - 1] = '\0';
+      return;
+    }
+
+    const auto& group = s_groups[s_selectedGroupIndex];
+    if (row == 0) {
+      std::strncpy(buf, group.name, bufLen - 1);
+      buf[bufLen - 1] = '\0';
+    } else if (row == 1) {
+      std::strncpy(buf, "Test", bufLen - 1);
+      buf[bufLen - 1] = '\0';
+    } else if (row == 2) {
+      std::strncpy(buf, "Add/Remove Shocker", bufLen - 1);
+      buf[bufLen - 1] = '\0';
+    } else if (row == 3) {
+      std::strncpy(buf, "Delete Group", bufLen - 1);
+      buf[bufLen - 1] = '\0';
+    } else {
+      const uint8_t memberIndex = static_cast<uint8_t>(row - kShockerGroupDetailStaticItemCount);
+      if (memberIndex < group.members.size()) {
+        getGroupMemberDisplayName(group.members[memberIndex], buf, bufLen);
+      } else {
+        std::strncpy(buf, "", bufLen - 1);
+        buf[bufLen - 1] = '\0';
+      }
+    }
+  }
+
+  uint8_t getGroupMemberSelectItemCount()
+  {
+    const auto onlineShockers = getOnlineShockersSnapshot();
+    return static_cast<uint8_t>(std::min<std::size_t>(static_cast<std::size_t>(s_shockerCount) + onlineShockers.size(), 255));
+  }
+
+  // Resolves a member-select row to a local/online shocker, its display name, and whether
+  // it's currently a member of the group being edited.
+  void getGroupMemberSelectItem(uint8_t row, char* nameBuf, uint8_t nameBufLen, bool& outIsOnline, bool& outIsMember)
+  {
+    outIsOnline = false;
+    outIsMember = false;
+    nameBuf[0] = '\0';
+
+    if (s_selectedGroupIndex >= s_groups.size()) {
+      return;
+    }
+    const auto& group = s_groups[s_selectedGroupIndex];
+
+    if (row < s_shockerCount) {
+      std::strncpy(nameBuf, s_shockers[row].name, nameBufLen - 1);
+      nameBuf[nameBufLen - 1] = '\0';
+      outIsOnline = false;
+      outIsMember = findGroupMemberIndex(group, false, s_shockers[row].rfId, nullptr) >= 0;
+      return;
+    }
+
+    const auto onlineShockers = getOnlineShockersSnapshot();
+    const uint8_t onlineIndex = static_cast<uint8_t>(row - s_shockerCount);
+    if (onlineIndex < onlineShockers.size()) {
+      std::strncpy(nameBuf, onlineShockers[onlineIndex].displayName.c_str(), nameBufLen - 1);
+      nameBuf[nameBufLen - 1] = '\0';
+      outIsOnline = true;
+      outIsMember = findGroupMemberIndex(group, true, 0, onlineShockers[onlineIndex].id.c_str()) >= 0;
+    }
+  }
+
+  // Toggles membership of the given local/online shocker in the group being edited, persists
+  // immediately, and returns the new membership state.
+  bool toggleGroupMemberSelection(uint8_t row)
+  {
+    if (s_selectedGroupIndex >= s_groups.size()) {
+      return false;
+    }
+    auto& group = s_groups[s_selectedGroupIndex];
+
+    if (row < s_shockerCount) {
+      const uint16_t rfId = s_shockers[row].rfId;
+      const int existing = findGroupMemberIndex(group, false, rfId, nullptr);
+      if (existing >= 0) {
+        group.members.erase(group.members.begin() + existing);
+        saveGroupPrefs();
+        return false;
+      }
+      ShockerGroupMemberRef member {};
+      member.isOnline = false;
+      member.localRfId = rfId;
+      group.members.push_back(member);
+      saveGroupPrefs();
+      return true;
+    }
+
+    const auto onlineShockers = getOnlineShockersSnapshot();
+    const uint8_t onlineIndex = static_cast<uint8_t>(row - s_shockerCount);
+    if (onlineIndex >= onlineShockers.size()) {
+      return false;
+    }
+    const std::string& id = onlineShockers[onlineIndex].id;
+    const int existing = findGroupMemberIndex(group, true, 0, id.c_str());
+    if (existing >= 0) {
+      group.members.erase(group.members.begin() + existing);
+      saveGroupPrefs();
+      return false;
+    }
+    ShockerGroupMemberRef member {};
+    member.isOnline = true;
+    std::strncpy(member.onlineId, id.c_str(), sizeof(member.onlineId) - 1);
+    group.members.push_back(member);
+    saveGroupPrefs();
+    return true;
+  }
+  // ────────────────────────────────────────────────
+
   bool isHelpButtonVisibleForCurrentView()
   {
-    if (s_settingsView == SettingsView::Connect || s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerLimitEdit || s_settingsView == SettingsView::ShockerProtocolEdit || s_settingsView == SettingsView::AccountLink || s_settingsView == SettingsView::UpdatePrompt || s_settingsView == SettingsView::UpdateRepoEdit) {
+    if (s_settingsView == SettingsView::Connect || s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerLimitEdit || s_settingsView == SettingsView::ShockerProtocolEdit || s_settingsView == SettingsView::ShockerGroupNameEdit || s_settingsView == SettingsView::AccountLink || s_settingsView == SettingsView::UpdatePrompt || s_settingsView == SettingsView::UpdateRepoEdit) {
       return false;
     }
 
@@ -904,9 +1338,12 @@ namespace {
     s_utcOffsetHours = s_oledPrefs.getChar(kPrefClockUtcOffsetHours, 0);
     OpenShock::NetworkTimeManager::SetEnabled(s_clockEnabled);
 
-    OpenShock::CaptivePortal::SetApEnabled(s_networkAccessPointEnabled, false);
-    OpenShock::CaptivePortal::SetEnabled(s_networkCaptivePortalEnabled);
-    OpenShock::CaptivePortal::SetAlwaysEnabled(s_networkCaptivePortalEnabled, false);
+    // Deliberately not calling CaptivePortal::Set*() here: this runs during
+    // OledDisplayManager::Init(), which executes before CaptivePortal::Init() in main.cpp's boot
+    // sequence. CaptivePortal::Init() independently loads this same persisted state (the "ap_en"
+    // key from this same Preferences namespace, and the captive-portal-enabled flag from Config)
+    // once it actually initializes, so calling these setters here would just mutate an
+    // uninitialized module and risk touching WiFi hardware before WiFiManager::Init() has run.
   }
 
   void markUserActivity()
@@ -1520,36 +1957,38 @@ namespace {
     } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::SystemClockOffsetEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
       return false;
     }
-    else if (view == SettingsView::ShockerNameEdit || view == SettingsView::UpdateRepoEdit) {
+    else if (view == SettingsView::ShockerNameEdit || view == SettingsView::UpdateRepoEdit || view == SettingsView::ShockerGroupNameEdit) {
       s_display.setFont(u8g2_font_6x10_tf);
-      return s_display.getStrWidth(view == SettingsView::ShockerNameEdit ? getSelectedShockerName() : "GitHub Source") > 122;
+      const char* title = (view == SettingsView::ShockerNameEdit) ? getSelectedShockerName() : (view == SettingsView::ShockerGroupNameEdit) ? getSelectedGroupName() : "GitHub Source";
+      return s_display.getStrWidth(title) > 122;
     } else if (view == SettingsView::ShockerList || view == SettingsView::ShockerDetail || view == SettingsView::ShockerLimitEdit || view == SettingsView::ShockerProtocolEdit) {
       // Check visible items for overflow
-      const auto onlineShockers = getOnlineShockersSnapshot();
       s_display.setFont(u8g2_font_6x10_tf);
       const uint8_t fv = (view == SettingsView::ShockerList) ? s_shockerListFirstVisible : s_shockerDetailFirstVisible;
-      const uint8_t ic = (view == SettingsView::ShockerList) ? getTotalShockerListItemCount(onlineShockers) : getShockerDetailItemCount();
+      const uint8_t ic = (view == SettingsView::ShockerList) ? getTotalShockerListItemCount(getOnlineShockersSnapshot()) : getShockerDetailItemCount();
       for (uint8_t row = 0; row < kSettingsVisibleCount; ++row) {
         const uint8_t idx = fv + row;
         if (idx >= ic) break;
         if (view == SettingsView::ShockerList) {
           char onlineLabel[24] = {};
+          const auto resolved = resolveShockerListRow(idx);
           const char* label = "Update List";
-          if (idx == 1) {
+          if (resolved.kind == ShockerListRowKind::KeepAlive) {
             label = "Keep Alive";
-          } else if (idx == 2) {
+          } else if (resolved.kind == ShockerListRowKind::AddShocker) {
             label = "Add Shocker";
-          } else if (idx >= kShockerListStaticItemCount) {
-            const uint8_t localIndex = static_cast<uint8_t>(idx - kShockerListStaticItemCount);
-            if (localIndex < s_shockerCount) {
-              label = s_shockers[localIndex].name;
-            } else {
-              const uint8_t onlineIndex = static_cast<uint8_t>(localIndex - s_shockerCount);
-              if (onlineIndex < onlineShockers.size()) {
-                std::strncpy(onlineLabel, onlineShockers[onlineIndex].displayName.c_str(), sizeof(onlineLabel) - 1);
-                onlineLabel[sizeof(onlineLabel) - 1] = '\0';
-                label = onlineLabel;
-              }
+          } else if (resolved.kind == ShockerListRowKind::CreateGroup) {
+            label = "Create Group";
+          } else if (resolved.kind == ShockerListRowKind::Group && resolved.index < s_groups.size()) {
+            label = s_groups[resolved.index].name;
+          } else if (resolved.kind == ShockerListRowKind::Local && resolved.index < s_shockerCount) {
+            label = s_shockers[resolved.index].name;
+          } else if (resolved.kind == ShockerListRowKind::Online) {
+            const auto onlineShockers = getOnlineShockersSnapshot();
+            if (resolved.index < onlineShockers.size()) {
+              std::strncpy(onlineLabel, onlineShockers[resolved.index].displayName.c_str(), sizeof(onlineLabel) - 1);
+              onlineLabel[sizeof(onlineLabel) - 1] = '\0';
+              label = onlineLabel;
             }
           }
 
@@ -1558,6 +1997,29 @@ namespace {
           char buf[24]; getShockerDetailItem(idx, buf, sizeof(buf));
           if (s_display.getStrWidth(buf) > (119 - 13)) return true;
         }
+      }
+      return false;
+    } else if (view == SettingsView::ShockerGroupDetail) {
+      s_display.setFont(u8g2_font_6x10_tf);
+      const uint8_t fv = s_groupDetailFirstVisible;
+      const uint8_t ic = getShockerGroupDetailItemCount();
+      for (uint8_t row = 0; row < kSettingsVisibleCount; ++row) {
+        const uint8_t idx = fv + row;
+        if (idx >= ic) break;
+        char buf[24]; getShockerGroupDetailItem(idx, buf, sizeof(buf));
+        if (s_display.getStrWidth(buf) > (119 - 13)) return true;
+      }
+      return false;
+    } else if (view == SettingsView::ShockerGroupMemberSelect) {
+      s_display.setFont(u8g2_font_6x10_tf);
+      const uint8_t fv = s_groupMemberSelectFirstVisible;
+      const uint8_t ic = getGroupMemberSelectItemCount();
+      for (uint8_t row = 0; row < kSettingsVisibleCount; ++row) {
+        const uint8_t idx = fv + row;
+        if (idx >= ic) break;
+        char nameBuf[24]; bool isOnline = false; bool isMember = false;
+        getGroupMemberSelectItem(idx, nameBuf, sizeof(nameBuf), isOnline, isMember);
+        if (s_display.getStrWidth(nameBuf) > (119 - 13)) return true;
       }
       return false;
     }
@@ -1810,37 +2272,79 @@ namespace {
   // ── Main-page shocker helpers ──────────────────────────────────────────────
 
   struct MainShockerRef {
-    bool isOnline;
-    uint8_t index; // local index or online vector index
+    MainShockerKind kind;
+    uint8_t index; // local index, online vector index, or group vector index
   };
 
   struct MainShockerTarget {
     OpenShock::ShockerModelType model;
     uint16_t rfId;
     uint8_t limit;
-    bool isOnline;
+    MainShockerKind kind;
     uint8_t index;
     bool valid;
   };
 
+  struct GroupMemberResolved {
+    OpenShock::ShockerModelType model;
+    uint16_t rfId;
+    uint8_t limit;
+  };
+
+  bool resolveGroupMember(const ShockerGroupMemberRef& member, GroupMemberResolved& out)
+  {
+    if (member.isOnline) {
+      const auto online = getOnlineShockersSnapshot();
+      for (const auto& o : online) {
+        if (o.id == member.onlineId) {
+          if (o.disabled) {
+            return false;
+          }
+          out = { o.model, o.mappedRfId, std::min<uint8_t>(o.limit, 99) };
+          return true;
+        }
+      }
+      return false;
+    }
+
+    for (uint8_t i = 0; i < s_shockerCount; ++i) {
+      if (s_shockers[i].rfId == member.localRfId) {
+        out = { shockerModelForStoredValue(s_shockers[i].protocol), s_shockers[i].rfId, std::min<uint8_t>(s_shockers[i].limit, 99) };
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Groups with <=1 member are excluded — they behave as if disabled on the main page.
   std::vector<MainShockerRef> buildMainShockerList()
   {
     std::vector<MainShockerRef> list;
     for (uint8_t i = 0; i < s_shockerCount; ++i) {
-      list.push_back({false, i});
+      list.push_back({ MainShockerKind::Local, i });
+    }
+    for (uint8_t i = 0; i < static_cast<uint8_t>(s_groups.size()); ++i) {
+      if (s_groups[i].members.size() > 1) {
+        list.push_back({ MainShockerKind::Group, i });
+      }
     }
     const auto online = getOnlineShockersSnapshot();
     for (uint8_t i = 0; i < static_cast<uint8_t>(online.size()); ++i) {
       if (!online[i].disabled) {
-        list.push_back({true, i});
+        list.push_back({ MainShockerKind::Online, i });
       }
     }
     return list;
   }
 
+  // A group has no group-wide limit — the dial runs 0-99 and each member is clamped
+  // individually against its own limit when a command actually fires.
   uint8_t getLimitForRef(const MainShockerRef& ref)
   {
-    if (ref.isOnline) {
+    if (ref.kind == MainShockerKind::Group) {
+      return 99;
+    }
+    if (ref.kind == MainShockerKind::Online) {
       const auto online = getOnlineShockersSnapshot();
       if (ref.index < static_cast<uint8_t>(online.size()) && !online[ref.index].disabled) {
         return std::min<uint8_t>(online[ref.index].limit, 99);
@@ -1855,7 +2359,7 @@ namespace {
 
   uint16_t getRfIdForRef(const MainShockerRef& ref)
   {
-    if (ref.isOnline) {
+    if (ref.kind == MainShockerKind::Online) {
       const auto online = getOnlineShockersSnapshot();
       if (ref.index < static_cast<uint8_t>(online.size()) && !online[ref.index].disabled) {
         return online[ref.index].mappedRfId;
@@ -1863,7 +2367,7 @@ namespace {
       return 0;
     }
 
-    if (ref.index < s_shockerCount) {
+    if (ref.kind == MainShockerKind::Local && ref.index < s_shockerCount) {
       return s_shockers[ref.index].rfId;
     }
 
@@ -1874,7 +2378,7 @@ namespace {
   {
     const auto list = buildMainShockerList();
     for (const auto& ref : list) {
-      if (ref.isOnline == s_activeShockerIsOnline && ref.index == s_activeShockerIdx) {
+      if (ref.kind == s_activeShockerKind && ref.index == s_activeShockerIdx) {
         out = ref;
         return true;
       }
@@ -1884,19 +2388,26 @@ namespace {
 
   void setActiveShockerRef(const MainShockerRef& ref)
   {
-    s_activeShockerIsOnline = ref.isOnline;
+    s_activeShockerKind = ref.kind;
     s_activeShockerIdx = ref.index;
   }
 
   uint8_t readStoredIntensityForRef(const MainShockerRef& ref, uint8_t fallback)
   {
+    if (ref.kind == MainShockerKind::Group) {
+      if (ref.index < s_groups.size()) {
+        return std::min<uint8_t>(s_groups[ref.index].desiredIntensity, 99);
+      }
+      return fallback;
+    }
+
     const uint16_t rfId = getRfIdForRef(ref);
     const uint8_t limit = getLimitForRef(ref);
     if (rfId == 0) {
       return std::min<uint8_t>(fallback, limit);
     }
 
-    auto& table = ref.isOnline ? s_onlineMainIntensityByRf : s_localMainIntensityByRf;
+    auto& table = (ref.kind == MainShockerKind::Online) ? s_onlineMainIntensityByRf : s_localMainIntensityByRf;
     for (auto& kv : table) {
       if (kv.first == rfId) {
         kv.second = std::min<uint8_t>(kv.second, limit);
@@ -1909,6 +2420,13 @@ namespace {
 
   void writeStoredIntensityForRef(const MainShockerRef& ref, uint8_t intensity)
   {
+    if (ref.kind == MainShockerKind::Group) {
+      if (ref.index < s_groups.size()) {
+        s_groups[ref.index].desiredIntensity = std::min<uint8_t>(intensity, 99);
+      }
+      return;
+    }
+
     const uint16_t rfId = getRfIdForRef(ref);
     const uint8_t limit = getLimitForRef(ref);
     if (rfId == 0) {
@@ -1916,7 +2434,7 @@ namespace {
     }
 
     const uint8_t clamped = std::min<uint8_t>(intensity, limit);
-    auto& table = ref.isOnline ? s_onlineMainIntensityByRf : s_localMainIntensityByRf;
+    auto& table = (ref.kind == MainShockerKind::Online) ? s_onlineMainIntensityByRf : s_localMainIntensityByRf;
     for (auto& kv : table) {
       if (kv.first == rfId) {
         kv.second = clamped;
@@ -1946,13 +2464,16 @@ namespace {
     s_localMainIntensityByRf.clear();
     s_onlineMainIntensityByRf.clear();
 
-    // Force a known-safe startup state: every shocker starts at intensity 0.
+    // Force a known-safe startup state: every shocker (and group) starts at intensity 0.
     for (uint8_t i = 0; i < s_shockerCount; ++i) {
       MainShockerRef localRef {
-        .isOnline = false,
+        .kind = MainShockerKind::Local,
         .index = i,
       };
       writeStoredIntensityForRef(localRef, 0);
+    }
+    for (auto& g : s_groups) {
+      g.desiredIntensity = 0;
     }
 
     OpenShock::RotaryEncoderManager::SetMaxIntensityLimit(0);
@@ -1962,7 +2483,7 @@ namespace {
   {
     const auto list = buildMainShockerList();
     if (list.empty()) {
-      s_activeShockerIsOnline = false;
+      s_activeShockerKind = MainShockerKind::Local;
       s_activeShockerIdx = 0;
       OpenShock::RotaryEncoderManager::SetMaxIntensityLimit(0);
       return;
@@ -1994,12 +2515,19 @@ namespace {
     return std::min<uint8_t>(OpenShock::RotaryEncoderManager::GetMaxIntensityLimit(), limit);
   }
 
-  // Returns the display name of the currently active main-page shocker.
+  // Returns the display name of the currently active main-page shocker (or group).
   const char* getActiveShockerName()
   {
     ensureActiveMainShockerSelected();
 
-    if (!s_activeShockerIsOnline) {
+    if (s_activeShockerKind == MainShockerKind::Group) {
+      if (s_activeShockerIdx < s_groups.size() && s_groups[s_activeShockerIdx].name[0] != '\0') {
+        return s_groups[s_activeShockerIdx].name;
+      }
+      return "Group";
+    }
+
+    if (s_activeShockerKind == MainShockerKind::Local) {
       if (s_activeShockerIdx < s_shockerCount) {
         if (s_shockers[s_activeShockerIdx].name[0] != '\0') {
           return s_shockers[s_activeShockerIdx].name;
@@ -2024,21 +2552,23 @@ namespace {
     return "none";
   }
 
+  // Resolves the active target for single-shocker (Local/Online) refs only; Group refs
+  // are handled separately by sendMainShockerCommand/stopMainShockerCommand via fan-out.
   MainShockerTarget getActiveShockerTarget()
   {
     ensureActiveMainShockerSelected();
 
     MainShockerRef ref {};
-    if (!getActiveShockerRef(ref)) {
-      return {{}, 0, 0, false, 0, false};
+    if (!getActiveShockerRef(ref) || ref.kind == MainShockerKind::Group) {
+      return {{}, 0, 0, MainShockerKind::Local, 0, false};
     }
 
-    if (ref.isOnline) {
+    if (ref.kind == MainShockerKind::Online) {
       const auto online = getOnlineShockersSnapshot();
       if (ref.index < static_cast<uint8_t>(online.size()) && !online[ref.index].disabled) {
-        return {online[ref.index].model, online[ref.index].mappedRfId, getLimitForRef(ref), true, ref.index, true};
+        return {online[ref.index].model, online[ref.index].mappedRfId, getLimitForRef(ref), MainShockerKind::Online, ref.index, true};
       }
-      return {{}, 0, 0, true, ref.index, false};
+      return {{}, 0, 0, MainShockerKind::Online, ref.index, false};
     }
 
     if (ref.index < s_shockerCount) {
@@ -2046,17 +2576,39 @@ namespace {
         shockerModelForStoredValue(s_shockers[ref.index].protocol),
         s_shockers[ref.index].rfId,
         getLimitForRef(ref),
-        false,
+        MainShockerKind::Local,
         ref.index,
         true
       };
     }
 
-    return {{}, 0, 0, false, ref.index, false};
+    return {{}, 0, 0, MainShockerKind::Local, ref.index, false};
   }
 
   void sendMainShockerCommand(OpenShock::ShockerCommandType type, uint8_t intensity)
   {
+    ensureActiveMainShockerSelected();
+
+    MainShockerRef ref {};
+    if (!getActiveShockerRef(ref)) {
+      return;
+    }
+
+    if (ref.kind == MainShockerKind::Group) {
+      if (ref.index >= s_groups.size()) {
+        return;
+      }
+      GroupMemberResolved resolved {};
+      for (const auto& member : s_groups[ref.index].members) {
+        if (resolveGroupMember(member, resolved)) {
+          const uint8_t clamped = std::min<uint8_t>(intensity, resolved.limit);
+          OpenShock::CommandHandler::HandleCommand(resolved.model, resolved.rfId, type, clamped, 2000);
+        }
+      }
+      s_mainCommandLastSentMs = OpenShock::millis();
+      return;
+    }
+
     const auto target = getActiveShockerTarget();
     if (!target.valid) {
       return;
@@ -2069,6 +2621,24 @@ namespace {
 
   void stopMainShockerCommand()
   {
+    MainShockerRef ref {};
+    if (!getActiveShockerRef(ref)) {
+      return;
+    }
+
+    if (ref.kind == MainShockerKind::Group) {
+      if (ref.index >= s_groups.size()) {
+        return;
+      }
+      GroupMemberResolved resolved {};
+      for (const auto& member : s_groups[ref.index].members) {
+        if (resolveGroupMember(member, resolved)) {
+          OpenShock::CommandHandler::HandleCommand(resolved.model, resolved.rfId, OpenShock::ShockerCommandType::Stop, 0, 0);
+        }
+      }
+      return;
+    }
+
     const auto target = getActiveShockerTarget();
     if (!target.valid) {
       return;
@@ -2231,6 +2801,19 @@ namespace {
       // Full overlay — skip normal list rendering
       pageTitle = "";
       itemCount = 0;
+    } else if (view == SettingsView::ShockerGroupDetail) {
+      pageTitle = getSelectedGroupName();
+      selection = &s_groupDetailSelection;
+      firstVisible = &s_groupDetailFirstVisible;
+      itemCount = getShockerGroupDetailItemCount();
+    } else if (view == SettingsView::ShockerGroupNameEdit) {
+      pageTitle = getSelectedGroupName();
+      itemCount = 0;
+    } else if (view == SettingsView::ShockerGroupMemberSelect) {
+      pageTitle = "Add/Remove";
+      selection = &s_groupMemberSelectSelection;
+      firstVisible = &s_groupMemberSelectFirstVisible;
+      itemCount = getGroupMemberSelectItemCount();
     }
 
     if (view == SettingsView::ShockerLimitEdit) {
@@ -2394,7 +2977,7 @@ namespace {
       s_display.setFont(menuFont);
     }
 
-    if (view == SettingsView::ShockerNameEdit) {
+    if (view == SettingsView::ShockerNameEdit || view == SettingsView::ShockerGroupNameEdit) {
       constexpr int kFieldX = 8;
       constexpr int kFieldY = 14;
       constexpr int kFieldW = 112;
@@ -2635,9 +3218,10 @@ namespace {
         const char* name = (net.ssid[0] != '\0') ? net.ssid : "<hidden>";
         drawScrollingText(name, 24, lineYs[row], textRegionMaxX - 24);
       } else if (view == SettingsView::ShockerList) {
-        if (itemIndex == 0) {
+        const auto resolved = resolveShockerListRow(itemIndex);
+        if (resolved.kind == ShockerListRowKind::UpdateList) {
           drawScrollingText("Update List", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
-        } else if (itemIndex == 1) {
+        } else if (resolved.kind == ShockerListRowKind::KeepAlive) {
           const int checkX = kShockerListPrefixX;
           const int checkY = lineYs[row] - 8;
           s_display.drawFrame(checkX, checkY, 8, 8);
@@ -2646,28 +3230,45 @@ namespace {
             s_display.drawLine(checkX + 6, checkY + 1, checkX + 1, checkY + 6);
           }
           drawScrollingText("Keep Alive", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
-        } else if (itemIndex == 2) {
+        } else if (resolved.kind == ShockerListRowKind::AddShocker) {
           drawScrollingText("Add Shocker", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
           s_display.drawStr(kShockerListPrefixX, lineYs[row], "+");
-        } else {
-          const uint8_t localIndex = static_cast<uint8_t>(itemIndex - kShockerListStaticItemCount);
-          if (localIndex < s_shockerCount) {
-            drawScrollingText(s_shockers[localIndex].name, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
-          } else {
-            const uint8_t onlineIndex = static_cast<uint8_t>(localIndex - s_shockerCount);
-            if (onlineIndex < onlineShockers.size()) {
-              char onlineLabel[24] = {};
-              std::strncpy(onlineLabel, onlineShockers[onlineIndex].displayName.c_str(), sizeof(onlineLabel) - 1);
-              onlineLabel[sizeof(onlineLabel) - 1] = '\0';
-              drawEncodedIcon(kLinkIconCode, kShockerListPrefixX, lineYs[row] - 7, 1);
-              drawScrollingText(onlineLabel, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
-            }
+        } else if (resolved.kind == ShockerListRowKind::CreateGroup) {
+          drawScrollingText("Create Group", kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
+          s_display.drawStr(kShockerListPrefixX, lineYs[row], "+");
+        } else if (resolved.kind == ShockerListRowKind::Group) {
+          if (resolved.index < s_groups.size()) {
+            drawEncodedIcon(kGroupIconCode, kShockerListPrefixX, lineYs[row] - 7, 1);
+            drawScrollingText(s_groups[resolved.index].name, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
+          }
+        } else if (resolved.kind == ShockerListRowKind::Local) {
+          if (resolved.index < s_shockerCount) {
+            drawScrollingText(s_shockers[resolved.index].name, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
+          }
+        } else if (resolved.kind == ShockerListRowKind::Online) {
+          if (resolved.index < onlineShockers.size()) {
+            char onlineLabel[24] = {};
+            std::strncpy(onlineLabel, onlineShockers[resolved.index].displayName.c_str(), sizeof(onlineLabel) - 1);
+            onlineLabel[sizeof(onlineLabel) - 1] = '\0';
+            drawEncodedIcon(kLinkIconCode, kShockerListPrefixX, lineYs[row] - 7, 1);
+            drawScrollingText(onlineLabel, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
           }
         }
       } else if (view == SettingsView::ShockerDetail) {
         char detailBuf[24];
         getShockerDetailItem(itemIndex, detailBuf, sizeof(detailBuf));
         drawScrollingText(detailBuf, labelX, lineYs[row], textRegionMaxX - labelX);
+      } else if (view == SettingsView::ShockerGroupDetail) {
+        char detailBuf[24];
+        getShockerGroupDetailItem(itemIndex, detailBuf, sizeof(detailBuf));
+        drawScrollingText(detailBuf, labelX, lineYs[row], textRegionMaxX - labelX);
+      } else if (view == SettingsView::ShockerGroupMemberSelect) {
+        char nameBuf[24] = {};
+        bool isOnline = false;
+        bool isMember = false;
+        getGroupMemberSelectItem(itemIndex, nameBuf, sizeof(nameBuf), isOnline, isMember);
+        s_display.drawStr(kShockerListPrefixX, lineYs[row], isMember ? "-" : "+");
+        drawScrollingText(nameBuf, kShockerListTextX, lineYs[row], textRegionMaxX - kShockerListTextX);
       } else if (view == SettingsView::System) {
         if (itemIndex == 1 || itemIndex == 3 || itemIndex == 4 || itemIndex == 5) {
           const int checkX = 13;
@@ -2944,7 +3545,7 @@ namespace {
     };
 
     const bool lockToBack = (view == SettingsView::Network && s_networkStatusOverlayOpen);
-    const bool isTextInputView = (view == SettingsView::ConnectPassword || view == SettingsView::ShockerNameEdit || view == SettingsView::AccountLink || view == SettingsView::UpdateRepoEdit);
+    const bool isTextInputView = (view == SettingsView::ConnectPassword || view == SettingsView::ShockerNameEdit || view == SettingsView::ShockerGroupNameEdit || view == SettingsView::AccountLink || view == SettingsView::UpdateRepoEdit);
     const bool showHelp = isHelpButtonVisibleForCurrentView();
     drawButton(kButtonX0, "Back", false);
     drawButton(kButtonX1, isTextInputView ? "Done" : (showHelp ? "Help" : ""), false);
@@ -3222,11 +3823,22 @@ namespace {
       const char* name = getActiveShockerName();
       drawRightAlignedTextOrScroll(name, kInfoLeftX, kInfoRightX, kNameY);
 
-      char limitText[4] = { '-', '-', '\0', '\0' };
-      const uint8_t limit = getActiveShockerLimit();
-      std::snprintf(limitText, sizeof(limitText), "%02u", static_cast<unsigned>(limit));
-      drawRightAlignedTextOrScroll("Limit:", kInfoLeftX, kInfoRightX, kLimitLabelY);
-      drawRightAlignedTextOrScroll(limitText, kInfoLeftX, kInfoRightX, kLimitValueY);
+      MainShockerRef activeRef {};
+      const bool isGroupActive = getActiveShockerRef(activeRef) && activeRef.kind == MainShockerKind::Group;
+
+      if (isGroupActive) {
+        char countText[4] = { '-', '-', '\0', '\0' };
+        const uint8_t memberCount = (activeRef.index < s_groups.size()) ? static_cast<uint8_t>(std::min<std::size_t>(s_groups[activeRef.index].members.size(), 99)) : 0;
+        std::snprintf(countText, sizeof(countText), "%02u", static_cast<unsigned>(memberCount));
+        drawRightAlignedTextOrScroll("PCS:", kInfoLeftX, kInfoRightX, kLimitLabelY);
+        drawRightAlignedTextOrScroll(countText, kInfoLeftX, kInfoRightX, kLimitValueY);
+      } else {
+        char limitText[4] = { '-', '-', '\0', '\0' };
+        const uint8_t limit = getActiveShockerLimit();
+        std::snprintf(limitText, sizeof(limitText), "%02u", static_cast<unsigned>(limit));
+        drawRightAlignedTextOrScroll("Limit:", kInfoLeftX, kInfoRightX, kLimitLabelY);
+        drawRightAlignedTextOrScroll(limitText, kInfoLeftX, kInfoRightX, kLimitValueY);
+      }
     }
 
     // Draw button labels at the bottom using the settings-menu button style.
@@ -3466,7 +4078,7 @@ namespace {
           s_pendingProtocol = static_cast<uint8_t>(cur % count);
           changed = true;
           continue;
-        } else if (s_settingsView == SettingsView::ShockerNameEdit) {
+        } else if (s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit) {
           int current = static_cast<int>(s_passwordCharSelection);
           current += static_cast<int>(evt.delta);
 
@@ -3477,6 +4089,14 @@ namespace {
           s_passwordCharSelection = static_cast<uint8_t>(current % kPasswordPickerItemCount);
           changed = true;
           continue;
+        } else if (s_settingsView == SettingsView::ShockerGroupDetail) {
+          selection = &s_groupDetailSelection;
+          firstVisible = &s_groupDetailFirstVisible;
+          itemCount = getShockerGroupDetailItemCount();
+        } else if (s_settingsView == SettingsView::ShockerGroupMemberSelect) {
+          selection = &s_groupMemberSelectSelection;
+          firstVisible = &s_groupMemberSelectFirstVisible;
+          itemCount = getGroupMemberSelectItemCount();
         } else if (s_settingsView == SettingsView::AccountMenu) {
           selection = &s_accountMenuSelection;
           firstVisible = &s_accountMenuFirstVisible;
@@ -3701,7 +4321,7 @@ namespace {
       const bool accountLinked = OpenShock::GatewayConnectionManager::IsLinked();
       const bool batteryChanged = updateBatterySample(now);
       const bool marqueeActive = isMainPageMarqueeActive();
-      const bool activeShockerChanged = s_activeShockerIsOnline != s_lastMainActiveShockerIsOnline || s_activeShockerIdx != s_lastMainActiveShockerIdx;
+      const bool activeShockerChanged = s_activeShockerKind != s_lastMainActiveShockerKind || s_activeShockerIdx != s_lastMainActiveShockerIdx;
 
       uint8_t clockHour = 0;
       uint8_t clockMinute = 0;
@@ -3715,7 +4335,7 @@ namespace {
         s_lastMainWifiStrength  = wifiStrength;
         s_lastMainGwOnline      = gwOnline;
         s_lastMainAccountLinked = accountLinked;
-        s_lastMainActiveShockerIsOnline = s_activeShockerIsOnline;
+        s_lastMainActiveShockerKind = s_activeShockerKind;
         s_lastMainActiveShockerIdx      = s_activeShockerIdx;
         s_lastMainClockShown    = clockShown;
         s_lastMainClockMinute   = clockShown ? static_cast<int8_t>(clockMinute) : -1;
@@ -3812,6 +4432,13 @@ namespace {
       const bool mainMarquee     = isMainPageMarqueeActive();
       const bool commandActive   = s_mainShockActive || s_mainVibrateActive;
       const int64_t now          = OpenShock::millis();
+
+      static int64_t s_lastGroupReconcileAt = 0;
+      if ((now - s_lastGroupReconcileAt) >= 3000) {
+        s_lastGroupReconcileAt = now;
+        reconcileGroupsWithOnlineList();
+      }
+
       const bool batteryPollDue  = (page == kPageMain) && ((now - s_lastBatterySampleAt) >= kBatterySamplePeriodMs);
       const bool marqueeActive   = settingsMarquee || mainMarquee;
       const bool sleepTrackingArmed = (s_screenSleepSeconds > 0 && !s_screenSleepActive) || (s_deviceSleepMinutes > 0);
@@ -3987,6 +4614,7 @@ bool OledDisplayManager::Init()
 
   loadNetworkSettingsPreferenceState();
   loadShockerPrefs();
+  loadGroupPrefs();
   resetMainShockerIntensitiesOnBoot();
 
   bool keepAliveEnabled = true;
@@ -4176,6 +4804,12 @@ void OledDisplayManager::HandleLeftButtonPressed()
         s_settingsView = SettingsView::Update;
       } else if (s_settingsView == SettingsView::ShockerNameEdit) {
         s_settingsView = SettingsView::ShockerDetail;
+      } else if (s_settingsView == SettingsView::ShockerGroupNameEdit) {
+        s_settingsView = SettingsView::ShockerGroupDetail;
+      } else if (s_settingsView == SettingsView::ShockerGroupMemberSelect) {
+        s_settingsView = SettingsView::ShockerGroupDetail;
+      } else if (s_settingsView == SettingsView::ShockerGroupDetail) {
+        s_settingsView = SettingsView::ShockerList;
       } else if (s_settingsView == SettingsView::SystemScreenSleepEdit || s_settingsView == SettingsView::SystemDeviceSleepEdit) {
         s_pendingSystemValue = s_originalSystemValue;
         s_settingsView = SettingsView::System;
@@ -4194,6 +4828,10 @@ void OledDisplayManager::HandleLeftButtonPressed()
         s_settingsView = SettingsView::ShockerList;
       } else if (s_settingsView == SettingsView::ShockerList) {
         s_settingsView = SettingsView::Root;
+        // Exiting the Shockers section entirely — the create-empty-group grace period ends here.
+        if (pruneShrunkGroupsIfAllowed()) {
+          saveGroupPrefs();
+        }
       } else if (s_settingsView == SettingsView::System || s_settingsView == SettingsView::About || s_settingsView == SettingsView::AccountMenu || s_settingsView == SettingsView::Update) {
         s_settingsView = SettingsView::Root;
       } else if (s_settingsView == SettingsView::ConnectPassword) {
@@ -4273,7 +4911,7 @@ void OledDisplayManager::HandleMiddleButtonPressed()
 
     int currentPos = -1;
     for (uint8_t i = 0; i < static_cast<uint8_t>(list.size()); ++i) {
-      if (list[i].isOnline == activeRef.isOnline && list[i].index == activeRef.index) {
+      if (list[i].kind == activeRef.kind && list[i].index == activeRef.index) {
         currentPos = i;
         break;
       }
@@ -4312,6 +4950,19 @@ void OledDisplayManager::HandleMiddleButtonPressed()
       }
     }
     s_settingsView = SettingsView::ShockerDetail;
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+    return;
+  }
+
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::ShockerGroupNameEdit) {
+    // Confirm group name edit
+    if (s_passwordLength > 0 && s_selectedGroupIndex < s_groups.size()) {
+      std::memset(s_groups[s_selectedGroupIndex].name, 0, sizeof(s_groups[s_selectedGroupIndex].name));
+      std::strncpy(s_groups[s_selectedGroupIndex].name, s_passwordInput, sizeof(s_groups[s_selectedGroupIndex].name) - 1);
+      saveGroupPrefs();
+    }
+    s_settingsView = SettingsView::ShockerGroupDetail;
     s_forceRedraw.store(true, std::memory_order_relaxed);
     requestRefresh();
     return;
@@ -4469,7 +5120,7 @@ void OledDisplayManager::HandleRightButtonPressed()
 
   if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings) {
     // Right is now "Delete" (backspace) on text/number entry screens.
-    if (s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::UpdateRepoEdit) {
+    if (s_settingsView == SettingsView::ConnectPassword || s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit || s_settingsView == SettingsView::UpdateRepoEdit) {
       if (s_passwordLength > 0) {
         --s_passwordLength;
         s_passwordInput[s_passwordLength] = '\0';
@@ -4717,8 +5368,9 @@ void handleMenuEnterAction()
 
     if (s_settingsView == SettingsView::ShockerList) {
       const auto onlineShockers = getOnlineShockersSnapshot();
+      const auto resolved = resolveShockerListRow(s_shockerListSelection);
 
-      if (s_shockerListSelection == 0) {
+      if (resolved.kind == ShockerListRowKind::UpdateList) {
         // Update List — explicit on-demand refresh of the online shocker list.
         if (s_shockerListRefreshPending) {
           showInfoPopup("Already updating");
@@ -4730,7 +5382,7 @@ void handleMenuEnterAction()
             showInfoPopup("Update failed");
           }
         }
-      } else if (s_shockerListSelection == 1) {
+      } else if (resolved.kind == ShockerListRowKind::KeepAlive) {
         const bool nextState = !s_shockerKeepAliveEnabled;
         if (OpenShock::CommandHandler::SetKeepAliveEnabled(nextState)) {
           s_shockerKeepAliveEnabled = nextState;
@@ -4738,8 +5390,7 @@ void handleMenuEnterAction()
         } else {
           showInfoPopup("Failed to set keepalive");
         }
-      } else if (s_shockerListSelection == 2) {
-        // +Add Shocker
+      } else if (resolved.kind == ShockerListRowKind::AddShocker) {
         if (s_shockerCount < kMaxShockers) {
           const uint8_t idx = s_shockerCount;
           std::memset(&s_shockers[idx], 0, sizeof(s_shockers[idx]));
@@ -4749,29 +5400,49 @@ void handleMenuEnterAction()
           s_shockers[idx].rfId = findNextLocalRfId();
           ++s_shockerCount;
           saveShockerPrefs();
-          s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + s_shockerCount - 1);  // scroll to the new entry
+          s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + s_groups.size() + s_shockerCount - 1);  // scroll to the new entry
           const uint8_t totalItems = getTotalShockerListItemCount(onlineShockers);
           const uint8_t maxFV = (totalItems > kSettingsVisibleCount) ? (totalItems - kSettingsVisibleCount) : 0;
           s_shockerListFirstVisible = std::min(s_shockerListSelection, maxFV);
         } else {
           showInfoPopup("Max shockers reached");
         }
-      } else {
-        const uint8_t selected = static_cast<uint8_t>(s_shockerListSelection - kShockerListStaticItemCount);
-        if (selected < s_shockerCount) {
-          s_selectedShockerSource = ShockerSelectionSource::Local;
-          s_selectedShockerIndex = selected;
+      } else if (resolved.kind == ShockerListRowKind::CreateGroup) {
+        if (s_groups.size() < kMaxGroups) {
+          ShockerGroupEntry group {};
+          generateNextGroupName(group.name, sizeof(group.name));
+          s_groups.push_back(std::move(group));
+          saveGroupPrefs();
+          s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + s_groups.size() - 1);  // scroll to the new entry
+          const uint8_t totalItems = getTotalShockerListItemCount(onlineShockers);
+          const uint8_t maxFV = (totalItems > kSettingsVisibleCount) ? (totalItems - kSettingsVisibleCount) : 0;
+          s_shockerListFirstVisible = std::min(s_shockerListSelection, maxFV);
         } else {
-          const uint8_t onlineIndex = static_cast<uint8_t>(selected - s_shockerCount);
-          if (onlineIndex >= onlineShockers.size()) {
-            s_forceRedraw.store(true, std::memory_order_relaxed);
-            requestRefresh();
-            return;
-          }
-          s_selectedShockerSource = ShockerSelectionSource::Online;
-          s_selectedOnlineShockerIndex = onlineIndex;
+          showInfoPopup("Max groups reached");
         }
-
+      } else if (resolved.kind == ShockerListRowKind::Group) {
+        if (resolved.index < s_groups.size()) {
+          s_selectedGroupIndex = resolved.index;
+          s_groupDetailSelection = 0;
+          s_groupDetailFirstVisible = 0;
+          s_settingsView = SettingsView::ShockerGroupDetail;
+        }
+      } else if (resolved.kind == ShockerListRowKind::Local) {
+        if (resolved.index < s_shockerCount) {
+          s_selectedShockerSource = ShockerSelectionSource::Local;
+          s_selectedShockerIndex = resolved.index;
+          s_shockerDetailSelection = 0;
+          s_shockerDetailFirstVisible = 0;
+          s_settingsView = SettingsView::ShockerDetail;
+        }
+      } else {
+        if (resolved.index >= onlineShockers.size()) {
+          s_forceRedraw.store(true, std::memory_order_relaxed);
+          requestRefresh();
+          return;
+        }
+        s_selectedShockerSource = ShockerSelectionSource::Online;
+        s_selectedOnlineShockerIndex = resolved.index;
         s_shockerDetailSelection = 0;
         s_shockerDetailFirstVisible = 0;
         s_settingsView = SettingsView::ShockerDetail;
@@ -4874,6 +5545,8 @@ void handleMenuEnterAction()
         showInfoPopup("Testing...");
       } else if (s_shockerDetailSelection == 4) {
         // Delete this shocker profile
+        removeLocalMemberFromAllGroups(s_shockers[s_selectedShockerIndex].rfId);
+
         for (uint8_t i = s_selectedShockerIndex; i + 1 < s_shockerCount; ++i) {
           s_shockers[i] = s_shockers[i + 1];
         }
@@ -4886,7 +5559,7 @@ void handleMenuEnterAction()
           std::memset(&s_shockers[s_shockerCount], 0, sizeof(s_shockers[s_shockerCount]));
         }
 
-        s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + std::min<uint8_t>(s_selectedShockerIndex, (s_shockerCount > 0) ? static_cast<uint8_t>(s_shockerCount - 1) : 0));
+        s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + s_groups.size() + std::min<uint8_t>(s_selectedShockerIndex, (s_shockerCount > 0) ? static_cast<uint8_t>(s_shockerCount - 1) : 0));
         const uint8_t totalItems = getTotalShockerListItemCount(getOnlineShockersSnapshot());
         if (totalItems > 0) {
           const uint8_t maxSelection = static_cast<uint8_t>(totalItems - 1);
@@ -4911,14 +5584,14 @@ void handleMenuEnterAction()
         const auto onlineShockers = getOnlineShockersSnapshot();
         if (s_selectedOnlineShockerIndex < onlineShockers.size()) {
           OpenShock::GatewayConnectionManager::SetOnlineShockerLimit(onlineShockers[s_selectedOnlineShockerIndex].id, std::min<uint8_t>(s_pendingLimit, 99));
-          if (s_activeShockerIsOnline && s_activeShockerIdx == s_selectedOnlineShockerIndex) {
+          if (s_activeShockerKind == MainShockerKind::Online && s_activeShockerIdx == s_selectedOnlineShockerIndex) {
             applyActiveShockerIntensity(getCurrentActiveIntensity());
           }
         }
       } else {
         s_shockers[s_selectedShockerIndex].limit = s_pendingLimit;
         saveShockerPrefs();
-        if (!s_activeShockerIsOnline && s_activeShockerIdx == s_selectedShockerIndex) {
+        if (s_activeShockerKind == MainShockerKind::Local && s_activeShockerIdx == s_selectedShockerIndex) {
           applyActiveShockerIntensity(getCurrentActiveIntensity());
         }
       }
@@ -4938,7 +5611,7 @@ void handleMenuEnterAction()
       return;
     }
 
-    if (s_settingsView == SettingsView::ShockerNameEdit) {
+    if (s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit) {
       // Append character from picker (same as WiFi password)
       const char selected = passwordCharacterForSelection(s_passwordCharSelection);
       if (selected == '\b') {
@@ -4950,6 +5623,70 @@ void handleMenuEnterAction()
         s_passwordInput[s_passwordLength++] = selected;
         s_passwordInput[s_passwordLength] = '\0';
       }
+      s_forceRedraw.store(true, std::memory_order_relaxed);
+      requestRefresh();
+      return;
+    }
+
+    if (s_settingsView == SettingsView::ShockerGroupDetail) {
+      if (s_selectedGroupIndex >= s_groups.size()) {
+        s_settingsView = SettingsView::ShockerList;
+        s_forceRedraw.store(true, std::memory_order_relaxed);
+        requestRefresh();
+        return;
+      }
+
+      auto& group = s_groups[s_selectedGroupIndex];
+      if (s_groupDetailSelection == 0) {
+        // Edit name — load current name into picker state
+        std::memcpy(s_groupNameBackup, group.name, sizeof(s_groupNameBackup));
+        s_passwordLength = static_cast<uint8_t>(std::strlen(group.name));
+        std::memset(s_passwordInput, 0, sizeof(s_passwordInput));
+        std::strncpy(s_passwordInput, group.name, sizeof(s_passwordInput) - 1);
+        s_passwordCharSelection = static_cast<uint8_t>('a' - 31);
+        s_settingsView = SettingsView::ShockerGroupNameEdit;
+      } else if (s_groupDetailSelection == 1) {
+        // Test: beep every member of the group
+        GroupMemberResolved resolved {};
+        bool anySent = false;
+        for (const auto& member : group.members) {
+          if (resolveGroupMember(member, resolved)) {
+            OpenShock::CommandHandler::HandleCommand(resolved.model, resolved.rfId, OpenShock::ShockerCommandType::Sound, std::min<uint8_t>(50, resolved.limit), 1000);
+            anySent = true;
+          }
+        }
+        showInfoPopup(anySent ? "Testing..." : "No shockers in group");
+      } else if (s_groupDetailSelection == 2) {
+        s_groupMemberSelectSelection = 0;
+        s_groupMemberSelectFirstVisible = 0;
+        s_settingsView = SettingsView::ShockerGroupMemberSelect;
+        s_forceRedraw.store(true, std::memory_order_relaxed);
+        drawSettingsPage();
+      } else if (s_groupDetailSelection == 3) {
+        // Delete this group
+        s_groups.erase(s_groups.begin() + s_selectedGroupIndex);
+        saveGroupPrefs();
+        s_shockerListSelection = static_cast<uint8_t>(kShockerListStaticItemCount + std::min<uint8_t>(s_selectedGroupIndex, (s_groups.empty()) ? 0 : static_cast<uint8_t>(s_groups.size() - 1)));
+        const uint8_t totalItems = getTotalShockerListItemCount(getOnlineShockersSnapshot());
+        if (totalItems > 0) {
+          const uint8_t maxSelection = static_cast<uint8_t>(totalItems - 1);
+          s_shockerListSelection = std::min<uint8_t>(s_shockerListSelection, maxSelection);
+        } else {
+          s_shockerListSelection = 0;
+        }
+        const uint8_t maxFV = (totalItems > kSettingsVisibleCount) ? (totalItems - kSettingsVisibleCount) : 0;
+        s_shockerListFirstVisible = std::min(s_shockerListSelection, maxFV);
+        s_settingsView = SettingsView::ShockerList;
+        showInfoPopup("Group deleted");
+      }
+      s_forceRedraw.store(true, std::memory_order_relaxed);
+      requestRefresh();
+      return;
+    }
+
+    if (s_settingsView == SettingsView::ShockerGroupMemberSelect) {
+      const bool nowMember = toggleGroupMemberSelection(s_groupMemberSelectSelection);
+      (void)nowMember;
       s_forceRedraw.store(true, std::memory_order_relaxed);
       requestRefresh();
       return;
@@ -5134,7 +5871,7 @@ void OledDisplayManager::HandleRightButtonLongPressed()
     }
   }
 
-  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::ShockerNameEdit) {
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && (s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit)) {
     if (s_passwordLength > 0) {
       --s_passwordLength;
       s_passwordInput[s_passwordLength] = '\0';
@@ -5297,7 +6034,7 @@ void OledDisplayManager::NotifyGatewayShockerCommand(uint16_t mappedRfId, uint8_
   // Switch the main-page active shocker to the one that just received a gateway command.
   for (uint8_t i = 0; i < s_shockerCount; ++i) {
     if (s_shockers[i].rfId == mappedRfId) {
-      setActiveShockerRef({false, i});
+      setActiveShockerRef({MainShockerKind::Local, i});
       applyActiveShockerIntensity(intensity);
       applyGatewayUiState(true);
       return;
@@ -5306,7 +6043,7 @@ void OledDisplayManager::NotifyGatewayShockerCommand(uint16_t mappedRfId, uint8_
   const auto online = getOnlineShockersSnapshot();
   for (uint8_t i = 0; i < static_cast<uint8_t>(online.size()); ++i) {
     if (online[i].mappedRfId == mappedRfId && !online[i].disabled) {
-      setActiveShockerRef({true, i});
+      setActiveShockerRef({MainShockerKind::Online, i});
       applyActiveShockerIntensity(intensity);
       applyGatewayUiState(true);
       return;

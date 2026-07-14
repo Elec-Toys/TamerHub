@@ -563,12 +563,11 @@ bool WiFiManager::Init()
   }
   WiFi.setHostname(hostname.c_str());
 
+  // Bandaid: always bring STA up at boot regardless of what's persisted. Booting with STA
+  // persisted off while AP+captive portal are on has caused a boot crash loop; forcing STA on
+  // here sidesteps that state entirely. The real persisted preference is re-applied a few
+  // seconds after boot via ApplyPersistedStaState(), once the rest of boot has settled.
   bool stationEnabled = true;
-  Preferences prefs;
-  if (prefs.begin("oled_ui", false)) {
-    stationEnabled = prefs.getBool("wifi_en", true);
-    prefs.end();
-  }
 
   refreshPreferredSsidFromPreferences();
 
@@ -662,6 +661,18 @@ void WiFiManager::SetStaEnabled(bool enabled)
       (void)WiFiScanManager::StartScan();
     }
   }
+}
+
+void WiFiManager::ApplyPersistedStaState()
+{
+  bool stationEnabled = true;
+  Preferences prefs;
+  if (prefs.begin("oled_ui", true)) {
+    stationEnabled = prefs.getBool("wifi_en", true);
+    prefs.end();
+  }
+
+  SetStaEnabled(stationEnabled);
 }
 
 bool WiFiManager::Save(const char* ssid, std::string_view password, bool connect, wifi_auth_mode_t authMode)
