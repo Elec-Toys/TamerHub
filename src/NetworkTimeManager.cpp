@@ -9,64 +9,64 @@ const char* const TAG = "NetworkTimeManager";
 #include "util/TaskUtils.h"
 #include "wifi/WiFiManager.h"
 
+#include <Arduino.h>
+
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <cJSON.h>
-#include <string>
+#include <cstring>
+#include <ctime>
 #include <string_view>
 
 namespace {
   using namespace OpenShock;
 
-  // Step 1: auto-detects the caller's timezone from its public IP.
-  // Note: the shared HTTP client (HTTPRequestManager) only supports https:// URLs — it hardcodes
-  // the "https" protocol check in beginInternal(), so plain http:// requests always fail.
-  constexpr const char* kGeoApiUrl = "https://ipapi.co/json/";
-  // Step 2: resolves the current wall-clock time (DST already applied) for a named IANA timezone.
-  constexpr const char* kZoneTimeApiUrlPrefix = "https://timeapi.io/api/time/current/zone?timeZone=";
+  // Auto-detects the caller's timezone UTC offset (DST already applied) from its public IP.
+  // Actual wall-clock time comes from SNTP below, not this API — third-party "current time"
+  // APIs have their own server clocks, which can (and did, e.g. timeapi.io) drift several
+  // minutes behind real time. SNTP talks directly to purpose-built time servers instead.
+  constexpr const char* kGeoApiUrl  = "https://ipapi.co/json/";
+  constexpr const char* kNtpServer1 = "pool.ntp.org";
+  constexpr const char* kNtpServer2 = "time.nist.gov";
 
-  constexpr uint32_t kTimeApiTimeoutMs = 8'000;
-  constexpr int64_t kRetryIntervalMs   = 30'000;    // Retry cadence until the first successful fetch.
-  constexpr int64_t kResyncIntervalMs  = 3'600'000; // Opportunistic resync cadence once time is known (1h).
+  constexpr uint32_t kGeoApiTimeoutMs = 8'000;
+  constexpr int64_t kRetryIntervalMs  = 30'000;        // Retry cadence until the first successful geo lookup.
+  constexpr int64_t kResyncIntervalMs = 3'600'000;     // Re-check cadence once known (1h) — covers the device moving to a new timezone.
+  constexpr time_t kMinPlausibleEpoch = 1'700'000'000; // 2023-11-14 — anything earlier means SNTP hasn't synced yet.
 
   std::atomic<bool> s_enabled { false };
   std::atomic<bool> s_fetchInProgress { false };
-  std::atomic<bool> s_timeKnown { false };
+  std::atomic<bool> s_offsetKnown { false };
+  std::atomic<bool> s_sntpStarted { false };
   std::atomic<int64_t> s_lastFetchAttemptMs { 0 };
-  std::atomic<int32_t> s_secondsOfDayAtFetch { 0 };
-  std::atomic<int64_t> s_fetchMillisAnchor { 0 };
+  std::atomic<int32_t> s_utcOffsetSeconds { 0 };
 
   struct GeoResult {
-    std::string timezone;
-    bool valid = false;
+    int32_t utcOffsetSeconds = 0;
+    bool valid               = false;
   };
 
-  struct ZoneTimeResult {
-    int hour   = 0;
-    int minute = 0;
-    int second = 0;
-    bool valid  = false;
-  };
-
-  std::string PercentEncode(std::string_view input)
+  // Parses ipapi.co's "utc_offset" field, formatted as "+HHMM" / "-HHMM" (e.g. "+0200", "-0530").
+  bool TryParseUtcOffset(const char* str, int32_t& outSeconds)
   {
-    static constexpr char kHex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(input.size());
-    for (unsigned char c : input) {
-      if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-        out.push_back(static_cast<char>(c));
-      } else {
-        out.push_back('%');
-        out.push_back(kHex[(c >> 4) & 0xF]);
-        out.push_back(kHex[c & 0xF]);
-      }
+    if (str == nullptr || (str[0] != '+' && str[0] != '-')) {
+      return false;
     }
-    return out;
+
+    if (std::strlen(str) != 5 || !std::isdigit(static_cast<unsigned char>(str[1])) || !std::isdigit(static_cast<unsigned char>(str[2])) || !std::isdigit(static_cast<unsigned char>(str[3])) || !std::isdigit(static_cast<unsigned char>(str[4]))) {
+      return false;
+    }
+
+    const int hours   = (str[1] - '0') * 10 + (str[2] - '0');
+    const int minutes = (str[3] - '0') * 10 + (str[4] - '0');
+    const int32_t total = hours * 3600 + minutes * 60;
+
+    outSeconds = (str[0] == '-') ? -total : total;
+    return true;
   }
 
-  bool TryFetchTimezone(std::string& outTimezone)
+  bool TryFetchUtcOffset(int32_t& outSeconds)
   {
     auto response = OpenShock::HTTP::GetJSON<GeoResult>(
       kGeoApiUrl,
@@ -80,77 +80,38 @@ namespace {
           return false;
         }
 
-        const cJSON* zoneItem = cJSON_GetObjectItemCaseSensitive(json, "timezone");
-        if (!cJSON_IsString(zoneItem) || zoneItem->valuestring == nullptr) {
+        const cJSON* offsetItem = cJSON_GetObjectItemCaseSensitive(json, "utc_offset");
+        if (!cJSON_IsString(offsetItem) || offsetItem->valuestring == nullptr) {
           return false;
         }
 
-        out.timezone = zoneItem->valuestring;
-        out.valid    = true;
-        return true;
-      },
-      std::array<uint16_t, 1> {200},
-      kTimeApiTimeoutMs
-    );
-
-    if (response.result != OpenShock::HTTP::RequestResult::Success || !response.data.valid) {
-      OS_LOGW(TAG, "Failed to fetch timezone: %s [%d]", response.ResultToString(), response.code);
-      return false;
-    }
-
-    outTimezone = std::move(response.data.timezone);
-    return true;
-  }
-
-  bool TryFetchZoneTime(const std::string& timezone, ZoneTimeResult& outTime)
-  {
-    const std::string url = std::string(kZoneTimeApiUrlPrefix) + PercentEncode(timezone);
-
-    auto response = OpenShock::HTTP::GetJSON<ZoneTimeResult>(
-      url,
-      {
-        {"Accept",     "application/json"},
-        {"User-Agent", OpenShock::Constants::FW_USERAGENT}
-      },
-      [](int, const cJSON* json, ZoneTimeResult& out) -> bool {
-        const cJSON* hourItem   = cJSON_GetObjectItemCaseSensitive(json, "hour");
-        const cJSON* minuteItem = cJSON_GetObjectItemCaseSensitive(json, "minute");
-        const cJSON* secondItem = cJSON_GetObjectItemCaseSensitive(json, "seconds");
-
-        if (!cJSON_IsNumber(hourItem) || !cJSON_IsNumber(minuteItem)) {
+        if (!TryParseUtcOffset(offsetItem->valuestring, out.utcOffsetSeconds)) {
           return false;
         }
 
-        out.hour   = hourItem->valueint;
-        out.minute = minuteItem->valueint;
-        out.second = cJSON_IsNumber(secondItem) ? secondItem->valueint : 0;
-        out.valid  = true;
+        out.valid = true;
         return true;
       },
       std::array<uint16_t, 1> {200},
-      kTimeApiTimeoutMs
+      kGeoApiTimeoutMs
     );
 
     if (response.result != OpenShock::HTTP::RequestResult::Success || !response.data.valid) {
-      OS_LOGW(TAG, "Failed to fetch zone time: %s [%d]", response.ResultToString(), response.code);
+      OS_LOGW(TAG, "Failed to fetch UTC offset: %s [%d]", response.ResultToString(), response.code);
       return false;
     }
 
-    outTime = response.data;
+    outSeconds = response.data.utcOffsetSeconds;
     return true;
   }
 
   void networkTimeFetchTask(void*)
   {
-    std::string timezone;
-    ZoneTimeResult zoneTime;
-
-    if (TryFetchTimezone(timezone) && TryFetchZoneTime(timezone, zoneTime)) {
-      const int32_t secOfDay = (zoneTime.hour * 3600) + (zoneTime.minute * 60) + zoneTime.second;
-      s_secondsOfDayAtFetch.store(secOfDay, std::memory_order_relaxed);
-      s_fetchMillisAnchor.store(OpenShock::millis(), std::memory_order_relaxed);
-      s_timeKnown.store(true, std::memory_order_relaxed);
-      OS_LOGI(TAG, "Network time synced for zone %s", timezone.c_str());
+    int32_t offsetSeconds = 0;
+    if (TryFetchUtcOffset(offsetSeconds)) {
+      s_utcOffsetSeconds.store(offsetSeconds, std::memory_order_relaxed);
+      s_offsetKnown.store(true, std::memory_order_relaxed);
+      OS_LOGI(TAG, "UTC offset synced: %+d minutes", static_cast<int>(offsetSeconds / 60));
     }
 
     s_fetchInProgress.store(false, std::memory_order_relaxed);
@@ -169,18 +130,25 @@ void OpenShock::NetworkTimeManager::Update()
     return;
   }
 
-  if (s_fetchInProgress.load(std::memory_order_relaxed)) {
-    return;
-  }
-
   if (!OpenShock::WiFiManager::IsConnected()) {
     return;
   }
 
-  const bool known               = s_timeKnown.load(std::memory_order_relaxed);
-  const int64_t retryIntervalMs  = known ? kResyncIntervalMs : kRetryIntervalMs;
-  const int64_t lastAttempt      = s_lastFetchAttemptMs.load(std::memory_order_relaxed);
-  const int64_t now              = OpenShock::millis();
+  // SNTP syncs the system clock in the background once started (and keeps it in sync
+  // for as long as the device is up) — this only needs to be kicked off once. It is the
+  // actual source of wall-clock time; the geo lookup below only supplies the UTC offset.
+  if (!s_sntpStarted.exchange(true, std::memory_order_relaxed)) {
+    configTime(0, 0, kNtpServer1, kNtpServer2);
+  }
+
+  if (s_fetchInProgress.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  const bool known              = s_offsetKnown.load(std::memory_order_relaxed);
+  const int64_t retryIntervalMs = known ? kResyncIntervalMs : kRetryIntervalMs;
+  const int64_t lastAttempt     = s_lastFetchAttemptMs.load(std::memory_order_relaxed);
+  const int64_t now             = OpenShock::millis();
 
   if (lastAttempt != 0 && (now - lastAttempt) < retryIntervalMs) {
     return;
@@ -198,17 +166,22 @@ void OpenShock::NetworkTimeManager::Update()
 
 bool OpenShock::NetworkTimeManager::IsTimeKnown()
 {
-  return s_timeKnown.load(std::memory_order_relaxed);
+  if (!s_offsetKnown.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
+  return time(nullptr) >= kMinPlausibleEpoch;
 }
 
 bool OpenShock::NetworkTimeManager::GetCurrentLocalTime(uint8_t& hour24Out, uint8_t& minuteOut)
 {
-  if (!s_timeKnown.load(std::memory_order_relaxed)) {
+  if (!IsTimeKnown()) {
     return false;
   }
 
-  const int64_t elapsedSeconds = (OpenShock::millis() - s_fetchMillisAnchor.load(std::memory_order_relaxed)) / 1000;
-  const int64_t secOfDay       = ((s_secondsOfDayAtFetch.load(std::memory_order_relaxed) + elapsedSeconds) % 86400 + 86400) % 86400;
+  const time_t nowUtc         = time(nullptr);
+  const int32_t offsetSeconds = s_utcOffsetSeconds.load(std::memory_order_relaxed);
+  const int64_t secOfDay      = ((static_cast<int64_t>(nowUtc) + offsetSeconds) % 86400 + 86400) % 86400;
 
   hour24Out = static_cast<uint8_t>(secOfDay / 3600);
   minuteOut = static_cast<uint8_t>((secOfDay / 60) % 60);

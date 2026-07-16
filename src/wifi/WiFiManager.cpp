@@ -626,7 +626,7 @@ bool WiFiManager::IsStaEnabled()
   return (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA);
 }
 
-void WiFiManager::SetStaEnabled(bool enabled)
+static void applyStaEnabled(bool enabled)
 {
   WiFi.enableSTA(enabled);
 
@@ -638,7 +638,7 @@ void WiFiManager::SetStaEnabled(bool enabled)
 
   if (!enabled) {
     WiFiScanManager::AbortScan();
-    Disconnect();
+    WiFiManager::Disconnect();
   } else {
     // When re-enabling, try direct connect from credentials first.
     Config::WiFiCredentials creds;
@@ -660,6 +660,26 @@ void WiFiManager::SetStaEnabled(bool enabled)
     if (!startedConnect) {
       (void)WiFiScanManager::StartScan();
     }
+  }
+}
+
+static void setStaEnabledTask(void* arg)
+{
+  applyStaEnabled(arg != nullptr);
+  vTaskDelete(nullptr);
+}
+
+void WiFiManager::SetStaEnabled(bool enabled)
+{
+  // Cold-starting the STA driver (esp_wifi_init/start) plus the NVS reads/writes above it can
+  // take a while and needs a deep call stack. Callers include the rotary-encoder input task
+  // (tiny stack, must never block or the whole device becomes unresponsive to input) and the
+  // captive portal's web server, so this always runs on its own adequately-stacked task.
+  TaskHandle_t task = nullptr;
+  void* arg         = enabled ? reinterpret_cast<void*>(1) : nullptr;
+  if (TaskUtils::TaskCreateExpensive(setStaEnabledTask, "wifi_sta_en", 8192, arg, 1, &task) != pdPASS) {
+    OS_LOGE(TAG, "Failed to create STA-enable task, applying inline");
+    applyStaEnabled(enabled);
   }
 }
 

@@ -2094,6 +2094,7 @@ namespace {
     s_display.drawRFrame(kButtonX0, kButtonY, kButtonW, kButtonH, 2);
     s_display.drawStr(kButtonX0 + ((kButtonW - s_display.getStrWidth("Back")) / 2), kButtonY + 7, "Back");
     s_display.drawRFrame(kButtonX1, kButtonY, kButtonW, kButtonH, 2);
+    s_display.drawStr(kButtonX1 + ((kButtonW - s_display.getStrWidth("Done")) / 2), kButtonY + 7, "Done");
     s_display.drawRFrame(kButtonX2, kButtonY, kButtonW, kButtonH, 2);
     s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Exit")) / 2), kButtonY + 7, "Exit");
     s_display.sendBuffer();
@@ -3987,6 +3988,9 @@ namespace {
         continue;
       }
 
+      // Rotating the dial counts as activity, resetting the device-sleep idle timer.
+      markUserActivity();
+
       const uint8_t page = s_currentPage.load(std::memory_order_relaxed);
 
       if (page == kPageMain && s_inputLocked) {
@@ -4201,7 +4205,11 @@ namespace {
       if (s_mainShockActive || s_mainVibrateActive) {
         markUserActivity();
       }
-      const uint32_t nowMs = static_cast<uint32_t>(now);
+      // Re-read the clock instead of reusing `now` — markUserActivity() above may have just
+      // stamped s_lastUserInputAt with a slightly later timestamp than `now`, and comparing
+      // against the stale value would underflow this unsigned subtraction into a huge number,
+      // causing an instant false-positive timeout.
+      const uint32_t nowMs = static_cast<uint32_t>(OpenShock::millis());
       const uint32_t lastInputAt = s_lastUserInputAt.load(std::memory_order_relaxed);
       const uint32_t elapsedMs = nowMs - lastInputAt;
       const uint32_t timeoutMs = static_cast<uint32_t>(s_deviceSleepMinutes) * 60000U;
@@ -4687,6 +4695,9 @@ void OledDisplayManager::HandleEncoderButtonPressed()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -4728,6 +4739,9 @@ void OledDisplayManager::HandleEncoderButtonLongPressed()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (s_inputLocked && s_currentPage.load(std::memory_order_relaxed) == kPageMain) {
     s_lockFlashUntilMs = OpenShock::millis() + 250;
     s_forceRedraw.store(true, std::memory_order_relaxed);
@@ -4756,6 +4770,9 @@ void OledDisplayManager::HandleLeftButtonPressed()
   if (s_powerUiState != PowerUiState::Ready) {
     return;
   }
+
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
 
   if (wakeOnlyInputIfSleeping()) {
     return;
@@ -4860,6 +4877,9 @@ void OledDisplayManager::HandleLeftButtonLongPressed()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -4874,6 +4894,9 @@ void OledDisplayManager::HandleMiddleButtonPressed()
   if (s_powerUiState != PowerUiState::Ready) {
     return;
   }
+
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
 
   if (wakeOnlyInputIfSleeping()) {
     return;
@@ -4892,6 +4915,34 @@ void OledDisplayManager::HandleMiddleButtonPressed()
 
   if (s_inputLocked && s_currentPage.load(std::memory_order_relaxed) == kPageMain) {
     s_lockFlashUntilMs = OpenShock::millis() + 250;
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+    return;
+  }
+
+  // Middle = "Done" on the numeric picker screens, same commit as the encoder button.
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::SystemScreenSleepEdit) {
+    s_screenSleepSeconds = s_pendingSystemValue;
+    saveNetworkSettingsPreferenceState();
+    s_settingsView = SettingsView::System;
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+    return;
+  }
+
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::SystemDeviceSleepEdit) {
+    s_deviceSleepMinutes = s_pendingSystemValue;
+    saveNetworkSettingsPreferenceState();
+    s_settingsView = SettingsView::System;
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+    return;
+  }
+
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::SystemClockOffsetEdit) {
+    s_utcOffsetHours = s_pendingClockOffsetHours;
+    saveNetworkSettingsPreferenceState();
+    s_settingsView = SettingsView::System;
     s_forceRedraw.store(true, std::memory_order_relaxed);
     requestRefresh();
     return;
@@ -5066,6 +5117,9 @@ void OledDisplayManager::HandleMiddleButtonLongPressed()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -5094,6 +5148,9 @@ void OledDisplayManager::HandleRightButtonPressed()
   if (s_powerUiState != PowerUiState::Ready) {
     return;
   }
+
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
 
   if (wakeOnlyInputIfSleeping()) {
     return;
@@ -5859,6 +5916,9 @@ void OledDisplayManager::HandleRightButtonLongPressed()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -5898,6 +5958,9 @@ void OledDisplayManager::HandleLeftButtonDown()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -5929,6 +5992,9 @@ void OledDisplayManager::HandleLeftButtonReleased()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -5953,6 +6019,9 @@ void OledDisplayManager::HandleRightButtonDown()
   if (s_powerUiState != PowerUiState::Ready) {
     return;
   }
+
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
 
   if (wakeOnlyInputIfSleeping()) {
     return;
@@ -5985,6 +6054,9 @@ void OledDisplayManager::HandleRightButtonReleased()
     return;
   }
 
+  // Any physical input counts as activity, resetting the device-sleep idle timer.
+  markUserActivity();
+
   if (wakeOnlyInputIfSleeping()) {
     return;
   }
@@ -6010,6 +6082,9 @@ void OledDisplayManager::NotifyGatewayShockerCommand(uint16_t mappedRfId, uint8_
     if (!targetFound) {
       return;
     }
+
+    // Any gateway-issued command counts as activity, resetting the device-sleep idle timer.
+    markUserActivity();
 
     if (type == OpenShock::ShockerCommandType::Shock) {
       markUserActivity();

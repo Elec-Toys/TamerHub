@@ -9,6 +9,7 @@ const char* const TAG = "main";
 #include "estop/EStopManager.h"
 #include "events/Events.h"
 #include "GatewayConnectionManager.h"
+#include "input/HardResetWatchdog.h"
 #include "input/RotaryEncoderManager.h"
 #include "Logging.h"
 #include "NetworkTimeManager.h"
@@ -161,6 +162,11 @@ void setup()
 #if ARDUINO_USB_MODE
   OS_SERIAL_USB.begin(115'200);
 #endif
+
+  // Arm the hard-reset watchdog before anything else: holding the encoder button for 10s
+  // force-reboots the device from a dedicated task/core, independent of the rest of the
+  // app - so it still works even if something later in boot (or at runtime) locks up.
+  OpenShock::HardResetWatchdog::Init(static_cast<gpio_num_t>(OPENSHOCK_ENCODER_BUTTON_PIN), true);
 
   // Detect charger-only power-on: if the encoder button is not held at boot
   // the charger woke the device. Show a Charging screen and wait for a long
