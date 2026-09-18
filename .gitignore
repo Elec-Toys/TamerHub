@@ -54,3 +54,6 @@ TerminalLog.txt
 # Root-level source images (converted to C arrays, not committed as assets)
 /image.png
 /ET Logo.png
+
+# Scratch notes for drafting release notes later — not meant to be committed
+RELEASE_NOTES_DRAFT.md

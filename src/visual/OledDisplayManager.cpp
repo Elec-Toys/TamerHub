@@ -165,11 +165,65 @@ namespace {
   constexpr uint32_t kChargingScreenDurationMs = 5000;
   constexpr int kPowerHoldPin = OPENSHOCK_POWER_HOLD_PIN;
   constexpr int kDisplayPowerPin = OPENSHOCK_OLED_POWER_PIN;
+  constexpr int kDisplaySdaPin = OPENSHOCK_OLED_SDA_PIN;
+  constexpr int kDisplayScloPin = OPENSHOCK_OLED_SCL_PIN;
+  constexpr uint32_t kDisplayI2CFrequencyHz = 400000U;
   constexpr int kLogoWidth = 128;
   constexpr int kLogoHeight = 64;
-  constexpr uint16_t kBatteryNominalMaxMv = 4200;  // Typical single-cell LiPo full-charge voltage; auto-adjusts upward from here.
-  constexpr uint16_t kBatteryNominalMinMv = 3300;  // Typical single-cell LiPo empty-cutoff voltage; auto-adjusts downward from here.
-  constexpr float kBatteryDeadzoneRatio = 0.05f;  // 5% dead zone applied at both ends of the observed range.
+  constexpr uint16_t kBatteryNominalMaxMv = 4200;      // 100% calibration anchor (LiPo full-charge voltage). Sanity range: 3900-4350mV.
+  constexpr uint16_t kBatteryNominalMinMv = 3200;      // 0% calibration anchor (LiPo empty-cutoff voltage). Sanity range: 3000-3500mV.
+  constexpr uint16_t kBatteryCalMinSaneLowMv = 3000;
+  constexpr uint16_t kBatteryCalMinSaneHighMv = 3500;
+  constexpr uint16_t kBatteryCalMaxSaneLowMv = 3900;
+  constexpr uint16_t kBatteryCalMaxSaneHighMv = 4350;
+  constexpr uint16_t kBatteryInvalidReadingMv = 2800;  // Below this, treat the sample as a brownout/disconnected-battery glitch, not a real low bound.
+  constexpr uint16_t kBatteryResetVoltageMv = 4150;    // Sustained voltage above this allows the monotonic discharge guard to move the displayed % up again.
+  constexpr int64_t kBatteryResetWindowMs = 10'000;    // How long kBatteryResetVoltageMv must hold before an upward reset is allowed.
+  constexpr uint16_t kBatteryCalMaxLearnMarginMv = 30; // Minimum shortfall from the default 100% ceiling before it's worth learning a lower one.
+  constexpr float kBatteryEmaAlpha = 0.08f;            // Heavy EMA smoothing to reject WiFi/RF TX current-draw voltage sag.
+  constexpr uint8_t kBatteryNvsSchemaVersion = 2;      // Bumping this forces a one-time reset of any pre-v2 self-corrupted calibration bounds.
+
+  // Non-linear single-cell Li-ion/LiPo discharge curve, expressed as points between the nominal
+  // 0%/100% anchors above. Interpolated linearly between points, and rescaled onto the sanitized
+  // per-device calibration bounds (s_batteryCalMinMv/s_batteryCalMaxMv) at runtime, so recalibrating
+  // the two anchors reshapes the whole curve proportionally instead of needing a whole new table.
+  struct BatterySocPoint {
+    uint16_t nominalMv;
+    uint8_t pct;
+  };
+  constexpr std::array<BatterySocPoint, 7> kBatterySocTable {{
+    {3200,   0},
+    {3650,  10},
+    {3730,  25},
+    {3830,  50},
+    {3970,  75},
+    {4100,  90},
+    {4200, 100},
+  }};
+
+  // Real-world sensed-mV (post-divider, at the ADC pin) -> battery-terminal-mV calibration
+  // points, gathered with tools/battery_calibration (bench supply on the battery input, USB
+  // disconnected — USB backfeed skews the ADC reading). The sensed/actual ratio isn't perfectly
+  // constant across the range (divider tolerance + ADC non-linearity: ~1.63x at the low end vs.
+  // ~1.54x near full), so this is interpolated piecewise instead of scaled by a flat factor. The
+  // lowest point (3100mV) sits below the 0% anchor (kBatteryNominalMinMv) purely to keep
+  // interpolation accurate down to the calibration floor; 3000mV couldn't be reliably measured
+  // on this device.
+  struct AdcCalPoint {
+    uint16_t sensedMv;
+    uint16_t batteryMv;
+  };
+  constexpr std::array<AdcCalPoint, 9> kAdcCalTable {{
+    {1920, 3100},
+    {1968, 3200},
+    {2032, 3300},
+    {2320, 3650},
+    {2382, 3730},
+    {2465, 3830},
+    {2570, 3970},
+    {2663, 4100},
+    {2734, 4200},
+  }};
 
   enum class PowerUiState : uint8_t {
     BootDelay,
@@ -219,6 +273,7 @@ namespace {
   bool s_initialized = false;
   TaskHandle_t s_refreshTask = nullptr;
   std::atomic<uint8_t> s_currentPage = kPageMain;
+  bool s_lastWifiBrowseActiveSent = false;
   std::atomic<bool> s_forceRedraw = true;
   uint8_t s_lastMainLimitDrawn = 0xFF;
   uint8_t s_lastMainWifiStrength = 0xFF;
@@ -231,12 +286,15 @@ namespace {
   bool s_lastMainClockShown = false;
   uint8_t s_mainBatteryPercent = 1;
   bool s_batteryInitialized = false;
-  uint16_t s_batteryFilteredMv = 0;
+  float s_batteryFilteredMv = 0.0f;
+  uint32_t s_batteryEmaSampleCount = 0;  // Drives EMA warm-up; see updateBatterySample().
   int64_t s_lastBatterySampleAt = 0;
   int8_t s_batteryPendingDirection = 0;
   uint8_t s_batteryPendingCount = 0;
-  uint16_t s_batteryMaxMvObserved = kBatteryNominalMaxMv;
-  uint16_t s_batteryMinMvObserved = kBatteryNominalMinMv;
+  uint16_t s_batteryCalMinMv = kBatteryNominalMinMv;  // sanitized 0% calibration anchor (persisted)
+  uint16_t s_batteryCalMaxMv = kBatteryNominalMaxMv;  // sanitized 100% calibration anchor (persisted)
+  int64_t s_batteryHighVoltageSinceMs = 0;            // start of the current sustained-high-voltage window, for the monotonic guard's reset condition
+  bool s_batteryInvalidReadingWarned = false;
   // ── Main-page active shocker state ──
   MainShockerKind s_activeShockerKind = MainShockerKind::Local;
   uint8_t s_activeShockerIdx = 0;
@@ -332,6 +390,7 @@ namespace {
   int64_t s_powerUiDeadlineMs = 0;
   bool s_powerHoldPinConfigured = false;
   bool s_displayPowerPinConfigured = false;
+  int64_t s_displayPoweredOffAtMs = 0;  // 0 = not currently tracking an off period
   bool s_powerCutIssued = false;
   gpio_num_t s_encoderButtonPin = GPIO_NUM_NC;
   TaskHandle_t s_accountLinkTask = nullptr;
@@ -366,6 +425,7 @@ namespace {
   constexpr char kPrefBatteryPctEnabled[] = "bat_pc_en";
   constexpr char kPrefBatteryMaxMv[] = "bat_max_mv";
   constexpr char kPrefBatteryMinMv[] = "bat_min_mv";
+  constexpr char kPrefBatterySchemaVer[] = "bat_schema";
   constexpr char kPrefClockEnabled[] = "clk_en";
   constexpr char kPrefClockUtcOffsetHours[] = "clk_utc_off";
   constexpr char kShockerPrefsNamespace[] = "shockers";
@@ -394,7 +454,7 @@ namespace {
     "Battery Icon",
     "Battery Level",
     "Clock",
-    "UTC Offset",
+    "Clock Offset",
   };
 
   constexpr std::array<std::string_view, kConnectNetworkItemCount> kConnectNetworkItems {
@@ -430,10 +490,22 @@ namespace {
   constexpr std::string_view kLinkIconCode { "11770111000100010011111000011111001000100011100000000" };
   // Group marker icon: stand-in for U+2234 (THEREFORE) — the OLED's bitmap fonts have no such glyph (7x7)
   constexpr std::string_view kGroupIconCode { "11770000000011011001101100000000000110000011000000000" };
+  // Heart icon: special character selectable from shocker/group naming pickers — same
+  // rationale as kGroupIconCode above, the OLED's bitmap fonts have no heart glyph.
+  // Two hand-authored sizes (rather than one bitmap rescaled at draw time) to match this
+  // file's two active text fonts: u8g2_font_6x10_tf (menu/list text) and u8g2_font_5x8_tf
+  // (name-field/picker/main-page text).
+  constexpr uint8_t kHeartIconSizeLarge = 7;
+  constexpr std::array<uint8_t, 7> kHeartIconRowsLarge { 0b0110110, 0b1111111, 0b1111111, 0b0111110, 0b0011100, 0b0001000, 0b0000000 };
+  constexpr uint8_t kHeartIconSizeSmall = 5;
+  constexpr std::array<uint8_t, 5> kHeartIconRowsSmall { 0b01010, 0b11111, 0b11111, 0b01110, 0b00100 };
+  // Sentinel byte standing in for the heart inside name buffers — never produced by typing
+  // printable ASCII, so it can't collide with any character reachable from other pickers.
+  constexpr char kShockerNameHeartChar = '\x01';
   constexpr int kBatterySensePin = OPENSHOCK_BATTERY_SENSE_PIN;
   constexpr int64_t kBatterySamplePeriodMs = 750;
-  constexpr uint8_t kBatterySamplesPerCycle = 8;
-  // 625 µs × 8 samples = 5 ms = exactly one 200 Hz noise cycle → sinusoidal noise sums to zero
+  constexpr uint8_t kBatterySamplesPerCycle = 48;
+  // 625 µs × 48 samples = 30 ms = 6 whole 200 Hz noise cycles → sinusoidal noise sums to zero
   constexpr uint32_t kBatterySampleDelayUs = 625;
   constexpr uint8_t kBatteryNeighborConfirmCount = 6;
 
@@ -581,8 +653,13 @@ namespace {
 
   uint16_t findNextLocalRfId()
   {
-    for (uint32_t candidate = 1; candidate <= UINT16_MAX; ++candidate) {
-      const uint16_t rfId = static_cast<uint16_t>(candidate);
+    // Start from a random point in the ID space (instead of always scanning from 1) so that
+    // deleting a shocker and manually adding a new one doesn't hand out the same low ID again,
+    // which could cause a stray transmitter still bonded to the old ID to control the new entry.
+    const uint16_t startCandidate = static_cast<uint16_t>((esp_random() % UINT16_MAX) + 1);
+
+    for (uint32_t offset = 0; offset < UINT16_MAX; ++offset) {
+      const uint16_t rfId = static_cast<uint16_t>(((startCandidate - 1u + offset) % UINT16_MAX) + 1);
       bool usedByLocal = false;
       for (uint8_t i = 0; i < s_shockerCount; ++i) {
         if (s_shockers[i].rfId == rfId) {
@@ -1332,8 +1409,32 @@ namespace {
     s_screenSaverEnabled = s_oledPrefs.getBool(kPrefScreenSaverEnabled, false);
     s_batteryIconEnabled = s_oledPrefs.getBool(kPrefBatteryIconEnabled, true);
     s_batteryPercentEnabled = s_oledPrefs.getBool(kPrefBatteryPctEnabled, true);
-    s_batteryMaxMvObserved = s_oledPrefs.getUShort(kPrefBatteryMaxMv, kBatteryNominalMaxMv);
-    s_batteryMinMvObserved = s_oledPrefs.getUShort(kPrefBatteryMinMv, kBatteryNominalMinMv);
+    {
+      // Sanity-check and, on first boot after this firmware version, forcibly reset the persisted
+      // calibration bounds. Older firmware auto-widened these on every out-of-range ADC read, so a
+      // yanked battery or a single brownout could permanently corrupt them to near-0V — this clears
+      // that corruption once per device and then leaves the bounds alone (no more auto-updating).
+      const uint8_t storedSchema = s_oledPrefs.getUChar(kPrefBatterySchemaVer, 0);
+      uint16_t storedMinMv = s_oledPrefs.getUShort(kPrefBatteryMinMv, kBatteryNominalMinMv);
+      uint16_t storedMaxMv = s_oledPrefs.getUShort(kPrefBatteryMaxMv, kBatteryNominalMaxMv);
+
+      const bool needsMigration = storedSchema < kBatteryNvsSchemaVersion;
+      if (needsMigration || storedMinMv < kBatteryCalMinSaneLowMv || storedMinMv > kBatteryCalMinSaneHighMv) {
+        storedMinMv = kBatteryNominalMinMv;
+      }
+      if (needsMigration || storedMaxMv < kBatteryCalMaxSaneLowMv || storedMaxMv > kBatteryCalMaxSaneHighMv) {
+        storedMaxMv = kBatteryNominalMaxMv;
+      }
+
+      s_batteryCalMinMv = storedMinMv;
+      s_batteryCalMaxMv = storedMaxMv;
+
+      if (needsMigration) {
+        s_oledPrefs.putUShort(kPrefBatteryMinMv, storedMinMv);
+        s_oledPrefs.putUShort(kPrefBatteryMaxMv, storedMaxMv);
+        s_oledPrefs.putUChar(kPrefBatterySchemaVer, kBatteryNvsSchemaVersion);
+      }
+    }
     s_clockEnabled = s_oledPrefs.getBool(kPrefClockEnabled, false);
     s_utcOffsetHours = s_oledPrefs.getChar(kPrefClockUtcOffsetHours, 0);
     OpenShock::NetworkTimeManager::SetEnabled(s_clockEnabled);
@@ -1355,7 +1456,7 @@ namespace {
       s_screenSleepActive = false;
       if (wasPhysicallyOff) {
         setDisplayPower(true);
-        delay(10);
+        delay(30);
         s_display.begin();
       }
       s_display.setPowerSave(0);
@@ -1455,7 +1556,45 @@ namespace {
       s_displayPowerPinConfigured = true;
     }
 
-    digitalWrite(kDisplayPowerPin, enabled ? HIGH : LOW);
+    const bool haveI2CPins = kDisplaySdaPin >= 0 && kDisplayScloPin >= 0;
+
+    if (enabled) {
+      // If power was cut only moments ago, the controller's supply rail may not have discharged
+      // far enough for its power-on-reset to reliably trigger on a quick re-power — that's what
+      // produces the occasional garbage/misaligned frame after a fast sleep-then-wake. Guarantee a
+      // minimum true-off window before re-enabling so the controller always sees a clean POR.
+      constexpr int64_t kDisplayMinOffMs = 120;
+      if (s_displayPoweredOffAtMs != 0) {
+        const int64_t offForMs = OpenShock::millis() - s_displayPoweredOffAtMs;
+        if (offForMs < kDisplayMinOffMs) {
+          delay(static_cast<uint32_t>(kDisplayMinOffMs - offForMs));
+        }
+        s_displayPoweredOffAtMs = 0;
+      }
+
+      // Power the display back up first, then hand SDA/SCL back to the I2C peripheral. The caller
+      // is still responsible for re-initializing the display driver (s_display.begin()) afterwards.
+      digitalWrite(kDisplayPowerPin, HIGH);
+      if (haveI2CPins) {
+        Wire.begin(kDisplaySdaPin, kDisplayScloPin, kDisplayI2CFrequencyHz);
+      }
+    } else {
+      // Stop driving the bus and park both lines HIGH before cutting power. Once power is cut, the
+      // display's local ground floats — if SDA/SCL were left low, or toggling, or weakly pulled up,
+      // the driver IC partially powers itself through its input protection diodes, drawing current
+      // and latching garbage from bus noise even while "off". Driving both lines to a solid HIGH
+      // (matching the still-present VCC rail) equalizes the potential across every connected pin so
+      // no current has anywhere to flow.
+      if (haveI2CPins) {
+        Wire.end();
+        pinMode(kDisplaySdaPin, OUTPUT);
+        pinMode(kDisplayScloPin, OUTPUT);
+        digitalWrite(kDisplaySdaPin, HIGH);
+        digitalWrite(kDisplayScloPin, HIGH);
+      }
+      digitalWrite(kDisplayPowerPin, LOW);
+      s_displayPoweredOffAtMs = OpenShock::millis();
+    }
   }
 
   void beginPowerOffSequence()
@@ -1471,7 +1610,7 @@ namespace {
     s_mainCommandAutoStopAtMs = 0;
     if (s_screenSleepActive && !s_screenSaverEnabled) {
       setDisplayPower(true);
-      delay(10);
+      delay(30);
       s_display.begin();
     }
     s_screenSleepActive = false;
@@ -1641,10 +1780,14 @@ namespace {
     s_display.sendBuffer();
   }
 
-  char passwordCharacterForSelection(uint8_t selection)
+  char passwordCharacterForSelection(uint8_t selection, bool allowHeart = false)
   {
     if (selection == 0) {
       return '\b';
+    }
+
+    if (allowHeart && selection == kPasswordPickerItemCount) {
+      return kShockerNameHeartChar;
     }
 
     return static_cast<char>(31 + selection);
@@ -1868,15 +2011,82 @@ namespace {
     return false;
   }
 
+  // Picks the small or large heart bitmap based on the currently active font's ascent, instead
+  // of rescaling one bitmap at draw time — plain pixel-for-pixel blitting, nothing to get wrong
+  // with rounding/division math across arbitrary sizes.
+  bool heartUseLargeIcon()
+  {
+    return s_display.getAscent() >= kHeartIconSizeLarge;
+  }
+
+  int heartIconSizePx()
+  {
+    return heartUseLargeIcon() ? kHeartIconSizeLarge : kHeartIconSizeSmall;
+  }
+
+  void drawHeartIcon(int x, int y, uint8_t drawColor = 1)
+  {
+    const bool useLarge = heartUseLargeIcon();
+    const uint8_t gridSize = useLarge ? kHeartIconSizeLarge : kHeartIconSizeSmall;
+    const uint8_t previousColor = s_display.getDrawColor();
+    s_display.setDrawColor(drawColor);
+    for (uint8_t row = 0; row < gridSize; ++row) {
+      const uint8_t rowBits = useLarge ? kHeartIconRowsLarge[row] : kHeartIconRowsSmall[row];
+      for (uint8_t col = 0; col < gridSize; ++col) {
+        if (rowBits & (1 << (gridSize - 1 - col))) {
+          s_display.drawPixel(x + col, y + row);
+        }
+      }
+    }
+    s_display.setDrawColor(previousColor);
+  }
+
+  // Width/draw helpers that substitute a to-scale heart icon for kShockerNameHeartChar and,
+  // for everything else, advance by u8g2's real per-glyph advance width (u8g2_GetGlyphWidth /
+  // drawGlyph) rather than getStrWidth() on an isolated one-character string — the latter
+  // measures that glyph's own ink extent, which is narrower than its true advance and makes
+  // consecutive characters overlap.
+  int heartAwareTextWidth(const char* text)
+  {
+    int width = 0;
+    for (const char* p = text; *p != '\0'; ++p) {
+      if (*p == kShockerNameHeartChar) {
+        width += heartIconSizePx() + 1;
+      } else {
+        width += u8g2_GetGlyphWidth(s_display.getU8g2(), static_cast<uint16_t>(static_cast<unsigned char>(*p)));
+      }
+    }
+    return width;
+  }
+
+  void drawHeartAwareText(int x, int baselineY, const char* text)
+  {
+    int cursor = x;
+    for (const char* p = text; *p != '\0'; ++p) {
+      if (*p == kShockerNameHeartChar) {
+        const int sizePx = heartIconSizePx();
+        drawHeartIcon(cursor, baselineY - sizePx, 1);
+        cursor += sizePx + 1;
+      } else {
+        cursor += static_cast<int>(s_display.drawGlyph(cursor, baselineY, static_cast<uint16_t>(static_cast<unsigned char>(*p))));
+      }
+    }
+  }
+
   void drawScrollingText(std::string_view text, int x, int baselineY, int widthPx)
   {
     if (widthPx <= 0 || text.empty()) {
       return;
     }
 
-    const int textWidth = s_display.getStrWidth(text.data());
+    const bool hasHeart = text.find(kShockerNameHeartChar) != std::string_view::npos;
+    const int textWidth = hasHeart ? heartAwareTextWidth(text.data()) : s_display.getStrWidth(text.data());
     if (textWidth <= widthPx) {
-      s_display.drawStr(x, baselineY, text.data());
+      if (hasHeart) {
+        drawHeartAwareText(x, baselineY, text.data());
+      } else {
+        s_display.drawStr(x, baselineY, text.data());
+      }
       return;
     }
 
@@ -1889,8 +2099,13 @@ namespace {
     const int yBottom = baselineY - s_display.getDescent();
 
     s_display.setClipWindow(x, yTop, x + widthPx - 1, yBottom);
-    s_display.drawStr(x - offset, baselineY, text.data());
-    s_display.drawStr(x - offset + cycleWidth, baselineY, text.data());
+    if (hasHeart) {
+      drawHeartAwareText(x - offset, baselineY, text.data());
+      drawHeartAwareText(x - offset + cycleWidth, baselineY, text.data());
+    } else {
+      s_display.drawStr(x - offset, baselineY, text.data());
+      s_display.drawStr(x - offset + cycleWidth, baselineY, text.data());
+    }
     s_display.setMaxClipWindow();
   }
 
@@ -1948,13 +2163,16 @@ namespace {
     } else if (view == SettingsView::System) {
       firstVisible = &s_systemFirstVisible;
       itemCount = kSystemItemCount;
+    } else if (view == SettingsView::Update) {
+      firstVisible = &s_updateFirstVisible;
+      itemCount = kUpdateItemCount;
     } else if (view == SettingsView::ConnectPassword) {
       s_display.setFont(u8g2_font_6x10_tf);
       const char* title = (s_selectedConnectSsid[0] != '\0') ? s_selectedConnectSsid : "Password";
       return s_display.getStrWidth(title) > 122;
     } else if (view == SettingsView::AccountLink) {
       return false;
-    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::SystemClockOffsetEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::Update || view == SettingsView::UpdatePrompt) {
+    } else if (view == SettingsView::SystemScreenSleepEdit || view == SettingsView::SystemDeviceSleepEdit || view == SettingsView::SystemClockOffsetEdit || view == SettingsView::About || view == SettingsView::AccountMenu || view == SettingsView::UpdatePrompt) {
       return false;
     }
     else if (view == SettingsView::ShockerNameEdit || view == SettingsView::UpdateRepoEdit || view == SettingsView::ShockerGroupNameEdit) {
@@ -2053,8 +2271,27 @@ namespace {
         continue;
       }
 
+      // These three System rows replace their label with a composed value string when drawn
+      // (e.g. "Clock: +2h") — measure that instead of the plain menu label, or overflow here
+      // never gets detected and the row silently never auto-scrolls.
+      if (view == SettingsView::System && (itemIndex == 0 || itemIndex == 2 || itemIndex == 6)) {
+        char line[28] = {};
+        if (itemIndex == 0) {
+          std::snprintf(line, sizeof(line), "Screen Sleep: %us", static_cast<unsigned>(s_screenSleepSeconds));
+        } else if (itemIndex == 2) {
+          std::snprintf(line, sizeof(line), "Device Sleep: %um", static_cast<unsigned>(s_deviceSleepMinutes));
+        } else {
+          std::snprintf(line, sizeof(line), "Clock: %+dh", static_cast<int>(s_utcOffsetHours));
+        }
+        if (s_display.getStrWidth(line) > (textRegionMaxX - 13)) {
+          return true;
+        }
+        continue;
+      }
+
       const std::string_view item = getSettingsItem(view, itemIndex);
-      const int textX = (view == SettingsView::Network && (itemIndex == 0 || itemIndex == 1 || itemIndex == 2)) ? 24 : 13;
+      const bool checkboxRow = (view == SettingsView::Network && (itemIndex == 0 || itemIndex == 1 || itemIndex == 2)) || (view == SettingsView::Update && (itemIndex == 1 || itemIndex == 2));
+      const int textX = checkboxRow ? 24 : 13;
       if (s_display.getStrWidth(item.data()) > (textRegionMaxX - textX)) {
         return true;
       }
@@ -2169,13 +2406,57 @@ namespace {
     return 0;
   }
 
-  uint8_t batteryPercentFromMv(uint16_t batteryMv, uint16_t usedMinMv, uint16_t usedMaxMv)
+  uint32_t sensedMvToBatteryMv(uint32_t sensedMv)
   {
-    const uint16_t rangeMv = (usedMaxMv > usedMinMv) ? static_cast<uint16_t>(usedMaxMv - usedMinMv) : static_cast<uint16_t>(1);
-    const uint32_t clampedMv = std::clamp<uint32_t>(batteryMv, usedMinMv, usedMaxMv);
-    const float normalized = static_cast<float>(clampedMv - usedMinMv) / static_cast<float>(rangeMv);
-    const int percent = 1 + static_cast<int>(std::lround(normalized * 98.0f));
-    return static_cast<uint8_t>(std::clamp(percent, 1, 99));
+    // Extrapolate past either end of the table using its nearest segment's slope.
+    size_t loIdx = 0;
+    size_t hiIdx = 1;
+    if (sensedMv > kAdcCalTable.back().sensedMv) {
+      loIdx = kAdcCalTable.size() - 2;
+      hiIdx = kAdcCalTable.size() - 1;
+    } else if (sensedMv > kAdcCalTable.front().sensedMv) {
+      for (size_t i = 1; i < kAdcCalTable.size(); ++i) {
+        if (sensedMv <= kAdcCalTable[i].sensedMv) {
+          loIdx = i - 1;
+          hiIdx = i;
+          break;
+        }
+      }
+    }
+
+    const AdcCalPoint& a = kAdcCalTable[loIdx];
+    const AdcCalPoint& b = kAdcCalTable[hiIdx];
+    const float t = (static_cast<float>(sensedMv) - a.sensedMv) / static_cast<float>(b.sensedMv - a.sensedMv);
+    const float interpolatedMv = static_cast<float>(a.batteryMv) + t * static_cast<float>(static_cast<int32_t>(b.batteryMv) - a.batteryMv);
+
+    // Guard low-end extrapolation from going negative (e.g. a disconnected-battery reading near
+    // 0mV) — the invalid-reading check downstream expects a small non-negative value here, not
+    // an unsigned wraparound.
+    return static_cast<uint32_t>(std::lround(std::max(0.0f, interpolatedMv)));
+  }
+
+  uint8_t batteryPercentFromMv(uint16_t batteryMv, uint16_t calMinMv, uint16_t calMaxMv)
+  {
+    // Rescale a nominal LUT breakpoint onto this device's calibrated 0%/100% voltage anchors.
+    auto scaledBreakpointMv = [calMinMv, calMaxMv](uint16_t nominalMv) -> float {
+      const float frac = static_cast<float>(nominalMv - kBatteryNominalMinMv) / static_cast<float>(kBatteryNominalMaxMv - kBatteryNominalMinMv);
+      return static_cast<float>(calMinMv) + frac * static_cast<float>(calMaxMv - calMinMv);
+    };
+
+    const float mv = static_cast<float>(std::clamp<uint32_t>(batteryMv, calMinMv, calMaxMv));
+
+    for (size_t i = 1; i < kBatterySocTable.size(); ++i) {
+      const float hiMv = scaledBreakpointMv(kBatterySocTable[i].nominalMv);
+      if (mv <= hiMv || i == kBatterySocTable.size() - 1) {
+        const float loMv = scaledBreakpointMv(kBatterySocTable[i - 1].nominalMv);
+        const float t = (hiMv > loMv) ? (mv - loMv) / (hiMv - loMv) : 0.0f;
+        const int loPct = kBatterySocTable[i - 1].pct;
+        const int hiPct = kBatterySocTable[i].pct;
+        return static_cast<uint8_t>(std::clamp(std::lround(loPct + t * (hiPct - loPct)), 0L, 100L));
+      }
+    }
+
+    return 100;
   }
 
   bool updateBatterySample(int64_t nowMs)
@@ -2189,46 +2470,84 @@ namespace {
     }
     s_lastBatterySampleAt = nowMs;
 
-    uint32_t rawSum = 0;
+    // Calibrated-mV multisample average (esp_adc_cal under the hood, via the Arduino core), which
+    // corrects for the ADC's non-linearity far better than a raw-count linear scale would.
+    uint32_t mvSum = 0;
     for (uint8_t i = 0; i < kBatterySamplesPerCycle; ++i) {
-      rawSum += static_cast<uint32_t>(analogRead(kBatterySensePin));
+      mvSum += static_cast<uint32_t>(analogReadMilliVolts(kBatterySensePin));
       if (i + 1 < kBatterySamplesPerCycle) delayMicroseconds(kBatterySampleDelayUs);
     }
 
-    const uint32_t rawAvg = rawSum / kBatterySamplesPerCycle;
-    const uint32_t sensedMv = (rawAvg * 3300u + 2047u) / 4095u;
-    const uint32_t measuredBatteryMv = (sensedMv * 3u) / 2u;
+    const uint32_t sensedMv = mvSum / kBatterySamplesPerCycle;
+    const uint32_t measuredBatteryMv = sensedMvToBatteryMv(sensedMv);
 
-    // Auto-track the widest voltage range ever observed, persisting immediately so it
-    // sticks as the new bound for all future percentage calculations.
-    if (measuredBatteryMv > s_batteryMaxMvObserved) {
-      s_batteryMaxMvObserved = static_cast<uint16_t>(std::min<uint32_t>(measuredBatteryMv, 0xFFFFu));
-      if (s_oledPrefsReady) {
-        s_oledPrefs.putUShort(kPrefBatteryMaxMv, s_batteryMaxMvObserved);
+    // Reject brownout/disconnected-battery glitches outright instead of ever treating them as a
+    // new, valid lower calibration bound — that auto-widening is what corrupted NVS on deployed
+    // devices in the field.
+    if (measuredBatteryMv < kBatteryInvalidReadingMv) {
+      if (!s_batteryInvalidReadingWarned) {
+        OS_LOGW(TAG, "Battery reading %u mV looks invalid (battery removed/brownout?), ignoring", static_cast<unsigned>(measuredBatteryMv));
+        s_batteryInvalidReadingWarned = true;
       }
-    } else if (measuredBatteryMv < s_batteryMinMvObserved) {
-      s_batteryMinMvObserved = static_cast<uint16_t>(measuredBatteryMv);
-      if (s_oledPrefsReady) {
-        s_oledPrefs.putUShort(kPrefBatteryMinMv, s_batteryMinMvObserved);
+      return false;
+    }
+    s_batteryInvalidReadingWarned = false;
+
+    // Monotonic discharge guard: only a sustained near-full voltage is allowed to move the
+    // displayed percentage back up, so a TX-current sag recovering can't make it bounce.
+    if (measuredBatteryMv >= kBatteryResetVoltageMv) {
+      if (s_batteryHighVoltageSinceMs == 0) {
+        s_batteryHighVoltageSinceMs = nowMs;
       }
+    } else {
+      s_batteryHighVoltageSinceMs = 0;
+    }
+    const bool allowIncrease = s_batteryHighVoltageSinceMs != 0 && (nowMs - s_batteryHighVoltageSinceMs) >= kBatteryResetWindowMs;
+
+    // Some devices' divider/ADC combination can't physically reach kBatteryNominalMaxMv even at a
+    // genuine full charge (component tolerance, not a fault) — without this, those units could
+    // never show 100%. The first time the same sustained-plateau gate that unlocks the monotonic
+    // increase guard above fires while the ceiling is still untouched, adopt that plateau as this
+    // device's real 100% and persist it. Gated on the ceiling still being the untouched default so
+    // this can only ever fire once — it won't slowly drift down over successive charge cycles.
+    if (allowIncrease && s_batteryCalMaxMv == kBatteryNominalMaxMv && measuredBatteryMv + kBatteryCalMaxLearnMarginMv < s_batteryCalMaxMv) {
+      const uint16_t learnedMaxMv = static_cast<uint16_t>(std::clamp<uint32_t>(measuredBatteryMv, kBatteryCalMaxSaneLowMv, kBatteryCalMaxSaneHighMv));
+      s_batteryCalMaxMv = learnedMaxMv;
+      if (s_oledPrefsReady) {
+        s_oledPrefs.putUShort(kPrefBatteryMaxMv, learnedMaxMv);
+      }
+      OS_LOGI(TAG, "Learned a lower battery-full voltage for this device: %u mV (default was %u mV)", static_cast<unsigned>(learnedMaxMv), static_cast<unsigned>(kBatteryNominalMaxMv));
     }
 
-    // 5% dead zone at both ends of the observed range.
-    const uint16_t usedMaxMv = static_cast<uint16_t>(std::lround(s_batteryMaxMvObserved * (1.0f - kBatteryDeadzoneRatio)));
-    const uint16_t usedMinMv = static_cast<uint16_t>(std::lround(s_batteryMinMvObserved * (1.0f + kBatteryDeadzoneRatio)));
-    const uint16_t clampedBatteryMv = static_cast<uint16_t>(std::clamp<uint32_t>(measuredBatteryMv, usedMinMv, usedMaxMv));
+    const uint32_t clampedBatteryMv = std::clamp<uint32_t>(measuredBatteryMv, s_batteryCalMinMv, s_batteryCalMaxMv);
 
     if (!s_batteryInitialized) {
-      s_batteryFilteredMv = clampedBatteryMv;
-      s_mainBatteryPercent = batteryPercentFromMv(clampedBatteryMv, usedMinMv, usedMaxMv);
+      s_batteryFilteredMv = static_cast<float>(clampedBatteryMv);
+      s_batteryEmaSampleCount = 1;
+      s_mainBatteryPercent = batteryPercentFromMv(static_cast<uint16_t>(clampedBatteryMv), s_batteryCalMinMv, s_batteryCalMaxMv);
       s_batteryInitialized = true;
       return true;
     }
 
-    s_batteryFilteredMv = static_cast<uint16_t>((static_cast<uint32_t>(s_batteryFilteredMv) * 7u + clampedBatteryMv) / 8u);
-    const uint8_t candidatePercent = batteryPercentFromMv(s_batteryFilteredMv, usedMinMv, usedMaxMv);
+    // Warm-start the EMA: the very first sample is seeded before WiFi/RF starts drawing current,
+    // so a flat kBatteryEmaAlpha takes ~30-45s to decay from that unrepresentative value down to
+    // the real loaded voltage — visible as the percentage slowly ticking down after boot. Using a
+    // shrinking 1/n weight for the first dozen-or-so samples instead makes this a true running
+    // average that folds in the WiFi startup load within ~10s, then settles into the same heavy
+    // steady-state smoothing once 1/n drops below kBatteryEmaAlpha.
+    ++s_batteryEmaSampleCount;
+    const float warmupAlpha = 1.0f / static_cast<float>(s_batteryEmaSampleCount);
+    const float effectiveAlpha = std::max(warmupAlpha, kBatteryEmaAlpha);
+    s_batteryFilteredMv = effectiveAlpha * static_cast<float>(clampedBatteryMv) + (1.0f - effectiveAlpha) * s_batteryFilteredMv;
+    const uint8_t candidatePercent = batteryPercentFromMv(static_cast<uint16_t>(std::lround(s_batteryFilteredMv)), s_batteryCalMinMv, s_batteryCalMaxMv);
 
     if (candidatePercent == s_mainBatteryPercent) {
+      s_batteryPendingDirection = 0;
+      s_batteryPendingCount = 0;
+      return false;
+    }
+
+    if (candidatePercent > s_mainBatteryPercent && !allowIncrease) {
       s_batteryPendingDirection = 0;
       s_batteryPendingCount = 0;
       return false;
@@ -2245,7 +2564,7 @@ namespace {
     }
 
     if (s_batteryPendingCount >= kBatteryNeighborConfirmCount) {
-      s_mainBatteryPercent = static_cast<uint8_t>(std::clamp(static_cast<int>(s_mainBatteryPercent) + direction, 1, 99));
+      s_mainBatteryPercent = static_cast<uint8_t>(std::clamp(static_cast<int>(s_mainBatteryPercent) + direction, 0, 100));
       s_batteryPendingDirection = 0;
       s_batteryPendingCount = 0;
       return true;
@@ -2266,7 +2585,7 @@ namespace {
     s_display.drawFrame(x, y, kBodyW, kBodyH);
     s_display.drawBox(x + kBodyW, y + 2, kCapW, kCapH);
 
-    const int fillW = std::clamp((static_cast<int>(percent) * kInnerW + 98) / 99, 1, kInnerW);
+    const int fillW = std::clamp((static_cast<int>(percent) * kInnerW + 50) / 100, 0, kInnerW);
     s_display.drawBox(x + 1, y + 1, fillW, kInnerH);
   }
 
@@ -2655,10 +2974,15 @@ namespace {
     }
 
     const int widthPx = rightX - leftX + 1;
-    const int textWidth = s_display.getStrWidth(text.data());
+    const bool hasHeart = text.find(kShockerNameHeartChar) != std::string_view::npos;
+    const int textWidth = hasHeart ? heartAwareTextWidth(text.data()) : s_display.getStrWidth(text.data());
     if (textWidth <= widthPx) {
       const int textX = rightX - textWidth + 1;
-      s_display.drawStr(textX, baselineY, text.data());
+      if (hasHeart) {
+        drawHeartAwareText(textX, baselineY, text.data());
+      } else {
+        s_display.drawStr(textX, baselineY, text.data());
+      }
       return;
     }
 
@@ -2840,6 +3164,7 @@ namespace {
       s_display.drawRFrame(kButtonX0, kButtonY, kButtonW, kButtonH, 2);
       s_display.drawStr(kButtonX0 + ((kButtonW - s_display.getStrWidth("Back")) / 2), kButtonY + 7, "Back");
       s_display.drawRFrame(kButtonX1, kButtonY, kButtonW, kButtonH, 2);
+      s_display.drawStr(kButtonX1 + ((kButtonW - s_display.getStrWidth("Done")) / 2), kButtonY + 7, "Done");
       s_display.drawRFrame(kButtonX2, kButtonY, kButtonW, kButtonH, 2);
       s_display.drawStr(kButtonX2 + ((kButtonW - s_display.getStrWidth("Exit")) / 2), kButtonY + 7, "Exit");
       s_display.sendBuffer();
@@ -2895,7 +3220,7 @@ namespace {
       return;
     }
 
-    if (view == SettingsView::ConnectNetwork || view == SettingsView::ConnectPassword) {
+    if (view == SettingsView::ConnectNetwork || view == SettingsView::ConnectPassword || view == SettingsView::ShockerDetail || view == SettingsView::ShockerNameEdit) {
       drawScrollingText(pageTitle, 2, 8, 122);
     } else {
       s_display.drawStr(2, 8, pageTitle);
@@ -2979,6 +3304,11 @@ namespace {
     }
 
     if (view == SettingsView::ShockerNameEdit || view == SettingsView::ShockerGroupNameEdit) {
+      // Any shocker/group naming field gets the extra heart slot — just not the other pickers
+      // (WiFi password, GitHub URL, account link code).
+      const bool allowHeart = true;
+      const uint8_t pickerItemCount = static_cast<uint8_t>(kPasswordPickerItemCount + (allowHeart ? 1 : 0));
+
       constexpr int kFieldX = 8;
       constexpr int kFieldY = 14;
       constexpr int kFieldW = 112;
@@ -2994,7 +3324,7 @@ namespace {
       for (uint8_t i = 0; i < copyLen; ++i) {
         nameLine[i] = s_passwordInput[start + i];
       }
-      s_display.drawStr(kFieldX + 4, kFieldY + 11, nameLine);
+      drawHeartAwareText(kFieldX + 4, kFieldY + 11, nameLine);
 
       constexpr int kCenterX = 64;
       constexpr int kPickerY = 40;
@@ -3005,9 +3335,9 @@ namespace {
       for (int offset = -3; offset <= 3; ++offset) {
         int idx = static_cast<int>(s_passwordCharSelection) + offset;
         while (idx < 0) {
-          idx += kPasswordPickerItemCount;
+          idx += pickerItemCount;
         }
-        idx %= kPasswordPickerItemCount;
+        idx %= pickerItemCount;
 
         const int x = kCenterX + (offset * kSlotW);
         const bool selected = (offset == 0);
@@ -3017,17 +3347,22 @@ namespace {
           s_display.setDrawColor(0);
         }
 
-        char token[3] = {};
-        const char value = passwordCharacterForSelection(static_cast<uint8_t>(idx));
-        if (value == '\b') {
-          token[0] = '<';
-          token[1] = '-';
+        const char value = passwordCharacterForSelection(static_cast<uint8_t>(idx), allowHeart);
+        if (value == kShockerNameHeartChar) {
+          const int sizePx = heartIconSizePx();
+          drawHeartIcon(x - (sizePx / 2), kPickerY - sizePx, selected ? 0 : 1);
         } else {
-          token[0] = value;
-        }
+          char token[3] = {};
+          if (value == '\b') {
+            token[0] = '<';
+            token[1] = '-';
+          } else {
+            token[0] = value;
+          }
 
-        const int tokenX = x - (s_display.getStrWidth(token) / 2);
-        s_display.drawStr(tokenX, kPickerY, token);
+          const int tokenX = x - (s_display.getStrWidth(token) / 2);
+          s_display.drawStr(tokenX, kPickerY, token);
+        }
 
         if (selected) {
           s_display.setDrawColor(1);
@@ -3298,7 +3633,7 @@ namespace {
           drawScrollingText(line, labelX, lineYs[row], textRegionMaxX - labelX);
         } else if (itemIndex == 6) {
           char line[28] = {};
-          std::snprintf(line, sizeof(line), "UTC Offset: %+d h", static_cast<int>(s_utcOffsetHours));
+          std::snprintf(line, sizeof(line), "Clock: %+dh", static_cast<int>(s_utcOffsetHours));
           drawScrollingText(line, labelX, lineYs[row], textRegionMaxX - labelX);
         }
       } else if (view == SettingsView::Update && (itemIndex == 1 || itemIndex == 2)) {
@@ -4083,14 +4418,16 @@ namespace {
           changed = true;
           continue;
         } else if (s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit) {
+          // Naming fields get one extra picker slot for the heart character.
+          const int pickerItemCount = static_cast<int>(kPasswordPickerItemCount) + 1;
           int current = static_cast<int>(s_passwordCharSelection);
           current += static_cast<int>(evt.delta);
 
           while (current < 0) {
-            current += kPasswordPickerItemCount;
+            current += pickerItemCount;
           }
 
-          s_passwordCharSelection = static_cast<uint8_t>(current % kPasswordPickerItemCount);
+          s_passwordCharSelection = static_cast<uint8_t>(current % pickerItemCount);
           changed = true;
           continue;
         } else if (s_settingsView == SettingsView::ShockerGroupDetail) {
@@ -4165,6 +4502,20 @@ namespace {
   void refreshCurrentPage()
   {
     const int64_t now = OpenShock::millis();
+
+    // Tell WiFiManager whether WiFi-related UI is currently in view, regardless of how we got
+    // here or will leave — this single check covers every navigation path (forward, back, or a
+    // page switch away without backing out) instead of needing a push at each transition site.
+    {
+      const bool onSettingsPage = s_currentPage.load(std::memory_order_relaxed) == kPageSettings;
+      const bool wifiBrowseActive = onSettingsPage
+        && (s_settingsView == SettingsView::Network || s_settingsView == SettingsView::Connect || s_settingsView == SettingsView::ConnectNetwork || s_settingsView == SettingsView::ConnectPassword);
+      if (wifiBrowseActive != s_lastWifiBrowseActiveSent) {
+        s_lastWifiBrowseActiveSent = wifiBrowseActive;
+        OpenShock::WiFiManager::SetNetworkBrowseActive(wifiBrowseActive);
+      }
+    }
+
     if (updatePowerUiState(now)) {
       return;
     }
@@ -4515,9 +4866,11 @@ void OledDisplayManager::RunChargingModeIfNeeded(gpio_num_t encoderButtonPin)
   // Disconnecting the charger while in charging mode will power the device off.
   setPowerHoldState(false);
 
-  // Bring up the display.
+  // Bring up the display. On boards with no display power pin, setDisplayPower() is a no-op, so
+  // this Wire.begin() is what actually attaches the I2C peripheral there; on mosfet-equipped
+  // boards it's a harmless re-init on top of the one setDisplayPower(true) already did.
   setDisplayPower(true);
-  delay(10);
+  delay(30);
   Wire.begin(OPENSHOCK_OLED_SDA_PIN, OPENSHOCK_OLED_SCL_PIN, 400000U);
   s_detectedControllerType = detectOledControllerType();
   s_displayPtr = (s_detectedControllerType == OledControllerType::SSD1309)
@@ -4570,7 +4923,7 @@ void OledDisplayManager::RunChargingModeIfNeeded(gpio_num_t encoderButtonPin)
 
   // Restore display power so Init() can take over cleanly.
   setDisplayPower(true);
-  delay(10);
+  delay(30);
   s_display.setPowerSave(0);
   s_display.clearBuffer();
   s_display.sendBuffer();
@@ -4585,7 +4938,7 @@ bool OledDisplayManager::Init()
   esp_err_t err;
 
   setDisplayPower(true);
-  delay(10);
+  delay(30);
 
   Wire.begin(OPENSHOCK_OLED_SDA_PIN, OPENSHOCK_OLED_SCL_PIN, 400000U);
 
@@ -4943,6 +5296,29 @@ void OledDisplayManager::HandleMiddleButtonPressed()
     s_utcOffsetHours = s_pendingClockOffsetHours;
     saveNetworkSettingsPreferenceState();
     s_settingsView = SettingsView::System;
+    s_forceRedraw.store(true, std::memory_order_relaxed);
+    requestRefresh();
+    return;
+  }
+
+  // Middle = "Done" on the shocker limit picker, same commit as the encoder button.
+  if (s_currentPage.load(std::memory_order_relaxed) == kPageSettings && s_settingsView == SettingsView::ShockerLimitEdit) {
+    if (s_selectedShockerSource == ShockerSelectionSource::Online) {
+      const auto onlineShockers = getOnlineShockersSnapshot();
+      if (s_selectedOnlineShockerIndex < onlineShockers.size()) {
+        OpenShock::GatewayConnectionManager::SetOnlineShockerLimit(onlineShockers[s_selectedOnlineShockerIndex].id, std::min<uint8_t>(s_pendingLimit, 99));
+        if (s_activeShockerKind == MainShockerKind::Online && s_activeShockerIdx == s_selectedOnlineShockerIndex) {
+          applyActiveShockerIntensity(getCurrentActiveIntensity());
+        }
+      }
+    } else {
+      s_shockers[s_selectedShockerIndex].limit = s_pendingLimit;
+      saveShockerPrefs();
+      if (s_activeShockerKind == MainShockerKind::Local && s_activeShockerIdx == s_selectedShockerIndex) {
+        applyActiveShockerIntensity(getCurrentActiveIntensity());
+      }
+    }
+    s_settingsView = SettingsView::ShockerDetail;
     s_forceRedraw.store(true, std::memory_order_relaxed);
     requestRefresh();
     return;
@@ -5669,8 +6045,9 @@ void handleMenuEnterAction()
     }
 
     if (s_settingsView == SettingsView::ShockerNameEdit || s_settingsView == SettingsView::ShockerGroupNameEdit) {
-      // Append character from picker (same as WiFi password)
-      const char selected = passwordCharacterForSelection(s_passwordCharSelection);
+      // Append character from picker (same as WiFi password). Naming fields allow the heart
+      // character to be selected; other pickers (password/URL/code) never reach this branch.
+      const char selected = passwordCharacterForSelection(s_passwordCharSelection, true);
       if (selected == '\b') {
         if (s_passwordLength > 0) {
           --s_passwordLength;

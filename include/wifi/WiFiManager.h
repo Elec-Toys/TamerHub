@@ -25,6 +25,13 @@ namespace OpenShock::WiFiManager {
   ///        this a few seconds after boot to restore the user's actual saved preference.
   void ApplyPersistedStaState();
 
+  /// @brief Tells WiFiManager whether the user is actively viewing WiFi-related UI (e.g. the OLED
+  ///        Network/Connect screens). While true, the background power-saving radio backoff (which
+  ///        otherwise powers STA off for increasingly long stretches while disconnected) is
+  ///        suspended so the radio stays fully on and responsive.
+  /// @param active Whether WiFi-related UI is currently being viewed
+  void SetNetworkBrowseActive(bool active);
+
   /// @brief Saves a network to the config
   /// @param ssid SSID of the network
   /// @param password Password of the network

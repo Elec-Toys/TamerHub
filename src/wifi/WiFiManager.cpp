@@ -21,6 +21,7 @@ const char* const TAG = "WiFiManager";
 
 #include "SimpleMutex.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -93,6 +94,23 @@ static std::atomic<uint8_t> s_preferredCredentialsID = 0;
 static char s_preferredSsid[33]                      = {0};
 static OpenShock::SimpleMutex s_networksMutex;
 static std::vector<WiFiNetwork> s_wifiNetworks;
+static std::atomic<bool> s_networkBrowseActive {false};
+
+// ── Disconnected-radio power-saving backoff ──────────────────────────────────────────────────
+// While STA is enabled but not connected (and nobody is actively browsing/connecting via the UI),
+// fully power the radio off between connection attempts instead of leaving it scanning/idling
+// indefinitely, waking it for a short window on an increasing schedule so a device that's rarely
+// near a known network isn't burning power hunting for one it may never find.
+constexpr int64_t kWifiBackoffStartMs      = 5'000;    // first "radio off" duration
+constexpr int64_t kWifiBackoffMaxMs        = 300'000;  // cap backoff at 5 minutes between checks
+constexpr int64_t kWifiBackoffOnWindowMs   = 4'000;    // how long each wake-up gets to connect before giving up again
+constexpr uint32_t kWifiBackoffScanEveryN  = 4;        // only run a full scan every Nth wake; other wakes just retry saved credentials directly
+static bool s_wifiBackoffRadioOff          = false;
+static int64_t s_wifiBackoffWakeAtMs       = 0;
+static int64_t s_wifiBackoffIntervalMs     = kWifiBackoffStartMs;
+static int64_t s_wifiBackoffOnSinceMs      = 0;
+static uint32_t s_wifiBackoffWakeCount     = 0;
+// ──────────────────────────────────────────────────────────────────────────────────────────────
 
 static void refreshPreferredSsidFromPreferences()
 {
@@ -476,6 +494,16 @@ static void wifimanagerUpdateTask(void*)
     const wifi_mode_t mode = WiFi.getMode();
     const bool staEnabled = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA);
     if (!staEnabled) {
+      if (s_wifiBackoffRadioOff) {
+        // We powered STA off ourselves for the power-saving backoff (as opposed to the user
+        // having disabled WiFi entirely) — wait for the backoff timer, or wake immediately if the
+        // user opened WiFi-related UI in the meantime.
+        if (s_networkBrowseActive.load(std::memory_order_relaxed) || now >= s_wifiBackoffWakeAtMs) {
+          WiFi.enableSTA(true);
+          s_wifiBackoffRadioOff = false;
+          s_wifiBackoffOnSinceMs = now;
+        }
+      }
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
@@ -499,30 +527,70 @@ static void wifimanagerUpdateTask(void*)
       }
     }
 
-    if (s_wifiState.load(std::memory_order_relaxed) == WiFiState::Disconnected && !WiFiScanManager::IsScanning()) {
-      if (!tryConnect()) {
-        // Scan results are empty or all networks are rate-limited.
-        // Try direct connect from credentials every 15 seconds.
-        if (lastDirectConnectAttempt == 0 || (now - lastDirectConnectAttempt) > 15'000) {
-          lastDirectConnectAttempt = now;
-          if (!tryConnectFromCredentials()) {
-            // No credentials at all, just scan
-            if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {  // Scan every 30s when disconnected
-              OS_LOGV(TAG, "No networks to connect to, starting scan...");
-              if (WiFiScanManager::StartScan()) {
-                lastScanRequest = now;
-              } else {
-                lastScanRequest = now - 29'000;
+    if (state == WiFiState::Connected) {
+      // Connected — reset the backoff so a future drop starts retrying quickly again.
+      s_wifiBackoffIntervalMs = kWifiBackoffStartMs;
+      s_wifiBackoffOnSinceMs  = 0;
+      s_wifiBackoffWakeCount  = 0;
+    } else if (state == WiFiState::Disconnected && !WiFiScanManager::IsScanning()) {
+      const bool browsing = s_networkBrowseActive.load(std::memory_order_relaxed);
+
+      if (browsing) {
+        // User is actively viewing WiFi UI — behave exactly as before: keep retrying/scanning
+        // continuously, and keep the backoff primed to start fast whenever browsing ends.
+        s_wifiBackoffIntervalMs = kWifiBackoffStartMs;
+        s_wifiBackoffOnSinceMs  = 0;
+
+        if (!tryConnect()) {
+          // Scan results are empty or all networks are rate-limited.
+          // Try direct connect from credentials every 15 seconds.
+          if (lastDirectConnectAttempt == 0 || (now - lastDirectConnectAttempt) > 15'000) {
+            lastDirectConnectAttempt = now;
+            if (!tryConnectFromCredentials()) {
+              // No credentials at all, just scan
+              if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {  // Scan every 30s when disconnected
+                OS_LOGV(TAG, "No networks to connect to, starting scan...");
+                if (WiFiScanManager::StartScan()) {
+                  lastScanRequest = now;
+                } else {
+                  lastScanRequest = now - 29'000;
+                }
               }
             }
+          } else if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {
+            OS_LOGV(TAG, "No networks to connect to, starting scan...");
+            if (WiFiScanManager::StartScan()) {
+              lastScanRequest = now;
+            } else {
+              lastScanRequest = now - 29'000;
+            }
           }
-        } else if (lastScanRequest == 0 || now - lastScanRequest > 30'000) {
-          OS_LOGV(TAG, "No networks to connect to, starting scan...");
-          if (WiFiScanManager::StartScan()) {
-            lastScanRequest = now;
-          } else {
-            lastScanRequest = now - 29'000;
+        }
+      } else {
+        // Nobody's watching: give each wake a short window to find/connect to a saved network,
+        // then power the radio fully off and wait increasingly longer before checking again.
+        if (s_wifiBackoffOnSinceMs == 0) {
+          s_wifiBackoffOnSinceMs = now;
+        }
+
+        if (!tryConnect()) {
+          const bool doScan = (s_wifiBackoffWakeCount % kWifiBackoffScanEveryN) == 0;
+          if (!tryConnectFromCredentials() && doScan && (lastScanRequest == 0 || (now - lastScanRequest) > 1'000)) {
+            if (WiFiScanManager::StartScan()) {
+              lastScanRequest = now;
+            }
           }
+        }
+
+        if ((now - s_wifiBackoffOnSinceMs) >= kWifiBackoffOnWindowMs) {
+          OS_LOGV(TAG, "No network found within backoff window, powering STA off for %lld ms", static_cast<long long>(s_wifiBackoffIntervalMs));
+          (void)WiFiScanManager::AbortScan();
+          WiFi.enableSTA(false);
+          s_wifiBackoffRadioOff  = true;
+          s_wifiBackoffOnSinceMs = 0;
+          ++s_wifiBackoffWakeCount;
+          s_wifiBackoffWakeAtMs   = now + s_wifiBackoffIntervalMs;
+          s_wifiBackoffIntervalMs = std::min<int64_t>(s_wifiBackoffIntervalMs * 2, kWifiBackoffMaxMs);
         }
       }
     }
@@ -681,6 +749,11 @@ void WiFiManager::SetStaEnabled(bool enabled)
     OS_LOGE(TAG, "Failed to create STA-enable task, applying inline");
     applyStaEnabled(enabled);
   }
+}
+
+void WiFiManager::SetNetworkBrowseActive(bool active)
+{
+  s_networkBrowseActive.store(active, std::memory_order_relaxed);
 }
 
 void WiFiManager::ApplyPersistedStaState()
